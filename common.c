@@ -100,6 +100,12 @@
 #include <mbedtls/md.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509.h>
+
+#if MBEDTLS_VERSION_MAJOR == 3
+#define MBEDTLS_PRIVATE_V3_ONLY(_q) MBEDTLS_PRIVATE(_q)
+#else
+#define MBEDTLS_PRIVATE_V3_ONLY(_q) _q
+#endif
 #endif
 
 #ifdef CONFIG_LIBDAEMON
@@ -568,6 +574,38 @@ void _inform(const char *thefilename, const int linenumber, const char *format, 
   pthread_setcancelstate(oldState, NULL);
 }
 
+void _debug_print_buffer(const char *thefilename, const int linenumber, int level, void *vbuf,
+                         size_t buf_len) {
+  if (level > debuglev)
+    return;
+  char *buf = (char *)vbuf;
+  char *obf =
+      malloc(buf_len * 4 + 1); // to be on the safe side -- 4 characters on average for each byte
+  if (obf != NULL) {
+    char *obfp = obf;
+    unsigned int obfc;
+    for (obfc = 0; obfc < buf_len; obfc++) {
+      snprintf(obfp, 3, "%02X", buf[obfc]);
+      obfp += 2;
+      if (obfc != buf_len - 1) {
+        if (obfc % 32 == 31) {
+          snprintf(obfp, 5, " || ");
+          obfp += 4;
+        } else if (obfc % 16 == 15) {
+          snprintf(obfp, 4, " | ");
+          obfp += 3;
+        } else if (obfc % 4 == 3) {
+          snprintf(obfp, 2, " ");
+          obfp += 1;
+        }
+      }
+    };
+    *obfp = 0;
+    _debug(thefilename, linenumber, level, "%s", obf);
+    free(obf);
+  }
+}
+
 // The following two functions are adapted slightly and with thanks from Jonathan Leffler's sample
 // code at
 // https://stackoverflow.com/questions/675039/how-can-i-create-directory-tree-in-c-linux
@@ -910,8 +948,14 @@ uint8_t *rsa_apply(uint8_t *input, int inlen, int *outlen, int mode) {
 
   mbedtls_pk_init(&pkctx);
 
+#if MBEDTLS_VERSION_MAJOR == 3
   rc = mbedtls_pk_parse_key(&pkctx, (unsigned char *)super_secret_key, sizeof(super_secret_key),
+                            NULL, 0, mbedtls_ctr_drbg_random, &ctr_drbg);
+#else
+  rc = mbedtls_pk_parse_key(&pkctx, (unsigned char *)super_secret_key, sizeof(super_secret_key), 
                             NULL, 0);
+
+#endif
   if (rc != 0)
     debug(1, "Error %d reading the private key.", rc);
 
@@ -920,19 +964,29 @@ uint8_t *rsa_apply(uint8_t *input, int inlen, int *outlen, int mode) {
 
   switch (mode) {
   case RSA_MODE_AUTH:
-    mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V15, MBEDTLS_MD_NONE);
-    outbuf = malloc(trsa->len);
+    mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V15, MBEDTLS_MD_NONE);    
+    outbuf = malloc(trsa->MBEDTLS_PRIVATE_V3_ONLY(len));
+#if MBEDTLS_VERSION_MAJOR == 3
+    rc = mbedtls_rsa_pkcs1_encrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg,
+                                   inlen, input, outbuf);
+#else
     rc = mbedtls_rsa_pkcs1_encrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_RSA_PRIVATE,
                                    inlen, input, outbuf);
+#endif
     if (rc != 0)
       debug(1, "mbedtls_pk_encrypt error %d.", rc);
-    *outlen = trsa->len;
+    *outlen = trsa->MBEDTLS_PRIVATE_V3_ONLY(len);
     break;
   case RSA_MODE_KEY:
     mbedtls_rsa_set_padding(trsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
-    outbuf = malloc(trsa->len);
+    outbuf = malloc(trsa->MBEDTLS_PRIVATE_V3_ONLY(len));
+#if MBEDTLS_VERSION_MAJOR == 3
+    rc = mbedtls_rsa_pkcs1_decrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg,
+                                   &olen, input, outbuf, trsa->MBEDTLS_PRIVATE_V3_ONLY(len));
+#else
     rc = mbedtls_rsa_pkcs1_decrypt(trsa, mbedtls_ctr_drbg_random, &ctr_drbg, MBEDTLS_RSA_PRIVATE,
                                    &olen, input, outbuf, trsa->len);
+#endif
     if (rc != 0)
       debug(1, "mbedtls_pk_decrypt error %d.", rc);
     *outlen = olen;
@@ -1694,7 +1748,7 @@ int _debug_mutex_unlock(pthread_mutex_t *mutex, const char *mutexname, const cha
 }
 
 void malloc_cleanup(void *arg) {
-  // debug(1, "malloc cleanup called.");
+  // debug(1, "malloc cleanup freeing %" PRIxPTR ".", arg);
   free(arg);
 }
 
@@ -1724,6 +1778,8 @@ void mutex_cleanup(void *arg) {
 }
 
 void mutex_unlock(void *arg) { pthread_mutex_unlock((pthread_mutex_t *)arg); }
+
+void rwlock_unlock(void *arg) { pthread_rwlock_unlock((pthread_rwlock_t *)arg); }
 
 void thread_cleanup(void *arg) {
   debug(3, "thread_cleanup called.");

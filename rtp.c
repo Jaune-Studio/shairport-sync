@@ -200,12 +200,9 @@ void *rtp_audio_receiver(void *arg) {
   float stat_mean = 0.0;
   float stat_M2 = 0.0;
 
-  int frame_count = 0;
   ssize_t nread;
   while (1) {
     nread = recv(conn->audio_socket, packet, sizeof(packet), 0);
-
-    frame_count++;
 
     uint64_t local_time_now_ns = get_absolute_time_in_ns();
     if (time_of_previous_packet_ns) {
@@ -2098,10 +2095,10 @@ void avcodec_alloc_context3_cleanup_handler(void *arg) {
   av_free(codec_context);
 }
 
-void avcodec_open2_cleanup_handler(void *arg) {
-  debug(3, "avcodec_open2_cleanup_handler");
-  AVCodecContext *codec_context = arg;
-  avcodec_close(codec_context);
+void avcodec_open2_cleanup_handler(__attribute__((unused)) void *arg) {
+  debug(3, "avcodec_open2_cleanup_handler -- does nothing right now");
+  // AVCodecContext *codec_context = arg;
+  // avcodec_free_context(&codec_context);
 }
 
 void av_parser_init_cleanup_handler(void *arg) {
@@ -2317,8 +2314,15 @@ void *rtp_buffered_audio_processor(void *arg) {
   // push a deallocator -- av_packet_free(pkt);
   pthread_cleanup_push(swr_alloc_cleanup_handler, &swr);
 
+
+// FFmpeg 5.1 or later...
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+  av_opt_set_chlayout(swr, "in_chlayout", &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, 0);
+  av_opt_set_chlayout(swr, "out_chlayout", &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, 0);
+#else
   av_opt_set_int(swr, "in_channel_layout", AV_CH_LAYOUT_STEREO, 0);
   av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+#endif
   av_opt_set_int(swr, "in_sample_rate", conn->input_rate, 0);
   av_opt_set_int(swr, "out_sample_rate", conn->input_rate,
                  0); // must match or the timing will be wrong`
@@ -2361,7 +2365,11 @@ void *rtp_buffered_audio_processor(void *arg) {
   };
 
   av_opt_set_sample_fmt(swr, "out_sample_fmt", av_format, 0);
-  swr_init(swr);
+  int swr_err = swr_init(swr);
+  if (swr_err !=0){
+    die("FFMpeg swr_init() failed Error %d (%s)",
+        swr_err, av_err2str(swr_err));
+  }
 
   uint8_t packet[16 * 1024];
   unsigned char m[16 * 1024]; // leave the first 7 bytes blank to make room for the ADTS

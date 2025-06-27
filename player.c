@@ -48,7 +48,6 @@
 
 #ifdef CONFIG_MBEDTLS
 #include <mbedtls/aes.h>
-#include <mbedtls/havege.h>
 #endif
 
 #ifdef CONFIG_POLARSSL
@@ -922,7 +921,7 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn) {
   pthread_cleanup_push(buffer_get_frame_cleanup_handler,
                        (void *)conn); // undo what's been done so far
   do {
-
+    pthread_testcancel(); // even if no packets are coming in...
     // get the time
     local_time_now = get_absolute_time_in_ns(); // type okay
     // debug(3, "buffer_get_frame is iterating");
@@ -1180,6 +1179,10 @@ static abuf_t *buffer_get_frame(rtsp_conn_info *conn) {
           if (conn->ab_buffering) {  // if we are getting packets but not yet forwarding them to the
                                      // player
             if (conn->first_packet_timestamp == 0) { // if this is the very first packet
+            
+              if (config.output->prepare_to_play) // tell the player to get ready
+                config.output->prepare_to_play(); // there could be more than one of these sent
+                
               conn->first_packet_timestamp =
                   curframe->given_timestamp; // we will keep buffering until we are
                                              // supposed to start playing this
@@ -1778,14 +1781,8 @@ double suggested_volume(rtsp_conn_info *conn) {
 void player_thread_cleanup_handler(void *arg) {
   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
 
-  if ((principal_conn == conn) && (conn != NULL)) {
-    if (config.output->stop) {
-      debug(2, "Connection %d: Stop the output backend.", conn->connection_number);
-      config.output->stop();
-    }
-  } else {
-    if (conn != NULL)
-      debug(1, "Connection %d: this conn is not the principal_conn.", conn->connection_number);
+  if (config.output->stop) {
+    config.output->stop();
   }
 
   int oldState;
@@ -2063,9 +2060,9 @@ void *player_thread_func(void *arg) {
   int64_t tsum_of_sync_errors, tsum_of_corrections, tsum_of_insertions_and_deletions,
       tsum_of_drifts;
   int64_t previous_sync_error = 0, previous_correction = 0;
-  uint64_t minimum_dac_queue_size;
-  int32_t minimum_buffer_occupancy;
-  int32_t maximum_buffer_occupancy;
+  uint64_t minimum_dac_queue_size = 0;
+  int32_t minimum_buffer_occupancy = 0;
+  int32_t maximum_buffer_occupancy = 0;
 
 #ifdef CONFIG_AIRPLAY_2
   conn->ap2_audio_buffer_minimum_size = -1;
@@ -2148,9 +2145,10 @@ void *player_thread_func(void *arg) {
   if ((config.output->parameters == NULL) || (conn->input_bit_depth > output_bit_depth) ||
       (config.playback_mode == ST_mono))
     conn->enable_dither = 1;
-
-  // remember, the output device may never have been initialised prior to this call
-  config.output->start(config.output_rate, config.output_format); // will need a corresponding stop
+  
+  // call the backend's start() function if it exists.
+  if (config.output->start != NULL)
+    config.output->start(config.output_rate, config.output_format);
 
   // we need an intermediate "transition" buffer
 
@@ -2276,9 +2274,7 @@ void *player_thread_func(void *arg) {
     if (conn->input_bytes_per_frame == 0)
       debug(1, "conn->input_bytes_per_frame is zero!");
 
-    pthread_testcancel();                     // allow a pthread_cancel request to take effect.
-    abuf_t *inframe = buffer_get_frame(conn); // this has cancellation point(s), but it's not
-                                              // guaranteed that they'll always be executed
+    abuf_t *inframe = buffer_get_frame(conn); // this has a (needed!) deliberate cancellation point in it.
     uint64_t local_time_now = get_absolute_time_in_ns(); // types okay
     config.last_access_to_volume_info_time =
         local_time_now; // ensure volume info remains seen as valid
@@ -3240,14 +3236,6 @@ void *player_thread_func(void *arg) {
             frames_seen_in_this_logging_interval = 0;
           }
 
-          // update the watchdog
-          if ((config.dont_check_timeout == 0) && (config.timeout != 0)) {
-            uint64_t time_now = get_absolute_time_in_ns();
-            debug_mutex_lock(&conn->watchdog_mutex, 1000, 0);
-            conn->watchdog_bark_time = time_now;
-            debug_mutex_unlock(&conn->watchdog_mutex, 0);
-          }
-
           // debug(1,"Sync error %lld frames. Amount to stuff %d." ,sync_error,amount_to_stuff);
 
           // new stats calculation. We want a running average of sync error, drift, adjustment,
@@ -3306,6 +3294,37 @@ void *player_thread_func(void *arg) {
                           //  debug(1, "This should never be called either.");
                           //  pthread_cleanup_pop(1); // pop the initial cleanup handler
   pthread_exit(NULL);
+}
+
+static void player_send_volume_metadata(uint8_t vol_mode_both, double airplay_volume, double scaled_attenuation, int32_t max_db, int32_t min_db, int32_t hw_max_db)
+{
+#ifdef CONFIG_METADATA
+    // here, send the 'pvol' metadata message when the airplay volume information
+    // is being used by shairport sync to control the output volume
+    char dv[128];
+    memset(dv, 0, 128);
+    if (config.ignore_volume_control == 0) {
+      if (vol_mode_both == 1) {
+        // normalise the maximum output to the hardware device's max output
+        snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume,
+                 (scaled_attenuation - max_db + hw_max_db) / 100.0,
+                 (min_db - max_db + hw_max_db) / 100.0, (max_db - max_db + hw_max_db) / 100.0);
+      } else {
+        snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume, scaled_attenuation / 100.0,
+                 min_db / 100.0, max_db / 100.0);
+      }
+    } else {
+      snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume, 0.0, 0.0, 0.0);
+    }
+    send_ssnc_metadata('pvol', dv, strlen(dv), 1);
+#else
+  (void)vol_mode_both;
+  (void)airplay_volume;
+  (void)scaled_attenuation;
+  (void)max_db;
+  (void)min_db;
+  (void)hw_max_db;
+#endif
 }
 
 void player_volume_without_notification(double airplay_volume, rtsp_conn_info *conn) {
@@ -3381,20 +3400,24 @@ void player_volume_without_notification(double airplay_volume, rtsp_conn_info *c
   // we have to consider the settings ignore_volume_control and mute.
 
   if (airplay_volume == -144.0) {
-
-    if ((config.output->mute) && (config.output->mute(1) == 0))
-      debug(2,
-            "player_volume_without_notification: volume mode is %d, airplay_volume is %f, "
-            "hardware mute is enabled.",
-            volume_mode, airplay_volume);
-    else {
-      conn->software_mute_enabled = 1;
-      debug(2,
-            "player_volume_without_notification: volume mode is %d, airplay_volume is %f, "
-            "software mute is enabled.",
-            volume_mode, airplay_volume);
+    // only mute if you're not ignoring the volume control
+    if (config.ignore_volume_control == 0) {
+      if ((config.output->mute) && (config.output->mute(1) == 0))
+        debug(2,
+              "player_volume_without_notification: volume mode is %d, airplay_volume is %f, "
+              "hardware mute is enabled.",
+              volume_mode, airplay_volume);
+      else {
+        conn->software_mute_enabled = 1;
+        debug(2,
+              "player_volume_without_notification: volume mode is %d, airplay_volume is %f, "
+              "software mute is enabled.",
+              volume_mode, airplay_volume);
+      }
     }
 
+    uint8_t vol_mode_both = (volume_mode == vol_both) ? 1 : 0;
+    player_send_volume_metadata(vol_mode_both, airplay_volume, 0, 0, 0, 0);
   } else {
     int32_t max_db = 0, min_db = 0;
     switch (volume_mode) {
@@ -3505,26 +3528,8 @@ void player_volume_without_notification(double airplay_volume, rtsp_conn_info *c
       inform("Output Level set to: %.2f dB.", scaled_attenuation / 100.0);
     }
 
-#ifdef CONFIG_METADATA
-    // here, send the 'pvol' metadata message when the airplay volume information
-    // is being used by shairport sync to control the output volume
-    char dv[128];
-    memset(dv, 0, 128);
-    if (config.ignore_volume_control == 0) {
-      if (volume_mode == vol_both) {
-        // normalise the maximum output to the hardware device's max output
-        snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume,
-                 (scaled_attenuation - max_db + hw_max_db) / 100.0,
-                 (min_db - max_db + hw_max_db) / 100.0, (max_db - max_db + hw_max_db) / 100.0);
-      } else {
-        snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume, scaled_attenuation / 100.0,
-                 min_db / 100.0, max_db / 100.0);
-      }
-    } else {
-      snprintf(dv, 127, "%.2f,%.2f,%.2f,%.2f", airplay_volume, 0.0, 0.0, 0.0);
-    }
-    send_ssnc_metadata('pvol', dv, strlen(dv), 1);
-#endif
+    uint8_t vol_mode_both = (volume_mode == vol_both) ? 1 : 0;
+    player_send_volume_metadata(vol_mode_both, airplay_volume, scaled_attenuation, max_db, min_db, hw_max_db);
 
     if (config.output->mute)
       config.output->mute(0);

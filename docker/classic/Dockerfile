@@ -1,4 +1,6 @@
-FROM alpine:3.17 AS builder
+ARG SHAIRPORT_SYNC_BRANCH=.
+
+FROM alpine:3.20 AS builder
 
 # Classic (aka AirPlay 1) Build
 
@@ -18,7 +20,7 @@ RUN apk -U add \
         libconfig-dev \
         libsndfile-dev \
         libtool \
-        mbedtls-dev \
+        openssl-dev \
         mosquitto-dev \
         popt-dev \
         pulseaudio-dev \
@@ -29,7 +31,7 @@ RUN git clone https://github.com/mikebrady/alac
 WORKDIR /alac
 RUN autoreconf -i
 RUN ./configure
-RUN make
+RUN make -j $(nproc)
 RUN make install
 WORKDIR /
 ##### ALAC END #####
@@ -40,7 +42,7 @@ COPY . .
 RUN git checkout "$SHAIRPORT_SYNC_BRANCH"
 WORKDIR /shairport-sync/build
 RUN autoreconf -i ../
-RUN ../configure --sysconfdir=/etc --with-alsa --with-pa --with-soxr --with-avahi --with-ssl=mbedtls \
+RUN CFLAGS="-O3" CXXFLAGS="-O3" ../configure --sysconfdir=/etc --with-alsa --with-pa --with-soxr --with-avahi --with-ssl=openssl \
         --with-metadata --with-dummy --with-pipe --with-dbus-interface \
         --with-stdout --with-mpris-interface --with-mqtt-client \
         --with-apple-alac --with-convolution
@@ -50,7 +52,7 @@ WORKDIR /
 ##### SPS END #####
 
 # Shairport Sync Runtime System
-FROM crazymax/alpine-s6:3.17-3.1.1.2
+FROM crazymax/alpine-s6:3.20-3.2.0.2
 
 ENV S6_CMD_WAIT_FOR_SERVICES=1
 ENV S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0
@@ -68,14 +70,15 @@ RUN apk -U add \
         libpulse \
         man-pages \
         mandoc \
-        mbedtls \
+        libcrypto3 \
         mosquitto \
         popt \
-        soxr
+        soxr \
+        curl
 
 # Copy build files.
 COPY --from=builder /shairport-sync/build/install/usr/local/bin/shairport-sync /usr/local/bin/shairport-sync
-COPY --from=builder /shairport-sync/build/install/usr/local/share/man/man7 /usr/share/man/man7
+COPY --from=builder /shairport-sync/build/install/usr/local/share/man/man1 /usr/share/man/man1
 COPY --from=builder /usr/local/lib/libalac.* /usr/local/lib/
 COPY --from=builder /shairport-sync/build/install/etc/shairport-sync.conf /etc/
 COPY --from=builder /shairport-sync/build/install/etc/shairport-sync.conf.sample /etc/
@@ -97,8 +100,14 @@ RUN addgroup -g 29 docker_audio && addgroup shairport-sync docker_audio && addgr
 # Remove anything we don't need.
 RUN rm -rf /lib/apk/db/*
 
+# Remove any statically-defined Avahi services, e.g. SSH and SFTP
+RUN rm -rf /etc/avahi/services/*.service
+
 # Add run script that will start SPS
 COPY ./docker/run.sh ./run.sh
 RUN chmod +x /run.sh
 
-Entrypoint ["/init","./run.sh"]
+# D-Bus might need this directory
+RUN mkdir -p /run/dbus
+
+ENTRYPOINT ["/init","./run.sh"]

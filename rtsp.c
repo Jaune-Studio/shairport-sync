@@ -3,7 +3,7 @@
  * Copyright (c) James Laird 2013
 
  * Modifications associated with audio synchronization, multithreading and
- * metadata handling copyright (c) Mike Brady 2014-2023
+ * metadata handling copyright (c) Mike Brady 2014-2024
  * All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person
@@ -142,12 +142,10 @@ rtsp_conn_info **conns;
 
 int metadata_running = 0;
 
-// always lock this when trying to make a conn the principal conn,
-// e.g. during an ANNOUNCE (Classic AirPlay) or SETUP (AirPlay 2)
-pthread_mutex_t principal_conn_acquisition_lock = PTHREAD_MUTEX_INITIALIZER;
-
 // always lock this when accessing the principal conn value
-pthread_mutex_t principal_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+// use a read lock when consulting and holding it
+// use a write lock if you want to change it
+pthread_rwlock_t principal_conn_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 // always lock this when accessing the list of connection threads
 pthread_mutex_t conns_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -274,7 +272,6 @@ void build_bonjour_strings(__attribute((unused)) rtsp_conn_info *conn) {
   snprintf(pkString, sizeof(pkString), "pk=");
   pkString_make(pkString + strlen("pk="), sizeof(pkString) - strlen("pk="),
                 config.airplay_device_id);
-
   txt_records[entry_number++] = "cn=0,1";
   txt_records[entry_number++] = "da=true";
   txt_records[entry_number++] = "et=0,1";
@@ -434,7 +431,8 @@ int pc_queue_add_item(pc_queue *the_queue, const void *the_stuff, int block) {
     } else
       rc = pthread_mutex_lock(&the_queue->pc_queue_lock);
     if (rc)
-      debug(1, "Error locking for pc_queue_add_item");
+      debug(1, "Error %d (\"%s\") locking for pc_queue_add_item. Block is %d.", rc, strerror(rc),
+            block);
     pthread_cleanup_push(pc_queue_cleanup_handler, (void *)the_queue);
     // leave this out if you want this to return if the queue is already full
     // irrespective of the block flag.
@@ -543,6 +541,7 @@ void cancel_all_RTSP_threads(airplay_stream_c stream_category, int except_this_o
          (stream_category == conns[i]->airplay_stream_category))) {
       pthread_join(conns[i]->thread, NULL);
       debug(1, "Connection %d: joined.", conns[i]->connection_number);
+
       free(conns[i]);
       conns[i] = NULL;
     }
@@ -565,21 +564,22 @@ void cancel_all_RTSP_threads(airplay_stream_c stream_category, int except_this_o
 // other devices.
 
 void release_play_lock(rtsp_conn_info *conn) {
-  pthread_cleanup_debug_mutex_lock(&principal_conn_lock, 100000,
-                                   1); // don't let the principal_conn be changed
-  if (principal_conn == conn) {        // if we have the player
+  // no need thread cancellation points in here
+  pthread_rwlock_wrlock(&principal_conn_lock);
+  if (principal_conn == conn) { // if we have the player
     if (conn != NULL)
       debug(2, "Connection %d: principal_conn released.", conn->connection_number);
     principal_conn = NULL; // let it go
   }
-  pthread_cleanup_pop(1); // release the principal_conn lock
+  pthread_rwlock_unlock(&principal_conn_lock);
 }
 
 // stop the current principal_conn from playing if necessary and make conn the principal_conn.
 
 int get_play_lock(rtsp_conn_info *conn, int allow_session_interruption) {
   int response = 0;
-  pthread_cleanup_debug_mutex_lock(&principal_conn_lock, 100000, 1);
+  pthread_rwlock_wrlock(&principal_conn_lock);
+  pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
   if (principal_conn != NULL)
     debug(2, "Connection %d: is requested to relinquish principal_conn.",
           principal_conn->connection_number);
@@ -594,70 +594,23 @@ int get_play_lock(rtsp_conn_info *conn, int allow_session_interruption) {
       warn("Connection %d: request to re-acquire principal_conn!",
            principal_conn->connection_number);
   } else if (allow_session_interruption != 0) {
-    player_stop(principal_conn);
-    debug(2, "Connection %d: termination requested.", principal_conn->connection_number);
-    pthread_cancel(principal_conn->thread);
-    usleep(2000000);       // don't know why this delay is needed.
+    rtsp_conn_info *previous_principal_conn = principal_conn;
+    // important -- demote the principal conn before cancelling it
+    principal_conn = NULL;
+    pthread_cancel(previous_principal_conn->thread);
+    // the previous principal thread will block on the principal conn lock when exiting
+    // so it's important not to wait for it here, e.g. don't put in a pthread_join here.
+    // threads are garbage-collected later
+    usleep(1000000);       // don't know why this delay is needed.
     principal_conn = conn; // make the conn the new principal_conn
     response = 1;          // interrupted an existing session
   } else {
     response = -1; // can't get it...
   }
   if (principal_conn != NULL)
-    debug(3, "Connection %d has acquired principal_conn.", principal_conn->connection_number);
+    debug(3, "Connection %d has principal_conn.", principal_conn->connection_number);
   pthread_cleanup_pop(1); // release the principal_conn lock
   return response;
-}
-
-void player_watchdog_thread_cleanup_handler(void *arg) {
-  rtsp_conn_info *conn = (rtsp_conn_info *)arg;
-  debug(3, "Connection %d: Watchdog Exit.", conn->connection_number);
-}
-
-void *player_watchdog_thread_code(void *arg) {
-  pthread_cleanup_push(player_watchdog_thread_cleanup_handler, arg);
-  rtsp_conn_info *conn = (rtsp_conn_info *)arg;
-  do {
-    usleep(2000000); // check every two seconds
-    // debug(3, "Connection %d: Check the thread is doing something...", conn->connection_number);
-#ifdef CONFIG_AIRPLAY_2
-    if ((config.dont_check_timeout == 0) && (config.timeout != 0) && (conn->airplay_type == ap_1)) {
-#else
-    if ((config.dont_check_timeout == 0) && (config.timeout != 0)) {
-#endif
-      debug_mutex_lock(&conn->watchdog_mutex, 1000, 0);
-      uint64_t last_watchdog_bark_time = conn->watchdog_bark_time;
-      debug_mutex_unlock(&conn->watchdog_mutex, 0);
-      if (last_watchdog_bark_time != 0) {
-        uint64_t time_since_last_bark =
-            (get_absolute_time_in_ns() - last_watchdog_bark_time) / 1000000000;
-        uint64_t ct = config.timeout; // go from int to 64-bit int
-
-        if (time_since_last_bark >= ct) {
-          conn->watchdog_barks++;
-          if (conn->watchdog_barks == 1) {
-            // debuglev = 3; // tell us everything.
-            debug(1,
-                  "Connection %d: As Yeats almost said, \"Too long a silence / can make a stone "
-                  "of the heart\".",
-                  conn->connection_number);
-            conn->stop = 1;
-            pthread_cancel(conn->thread);
-          } else if (conn->watchdog_barks == 3) {
-            if ((config.cmd_unfixable) && (config.unfixable_error_reported == 0)) {
-              config.unfixable_error_reported = 1;
-              command_execute(config.cmd_unfixable, "unable_to_cancel_play_session", 1);
-            } else {
-              die("an unrecoverable error, \"unable_to_cancel_play_session\", has been detected.",
-                  conn->connection_number);
-            }
-          }
-        }
-      }
-    }
-  } while (1);
-  pthread_cleanup_pop(0); // should never happen
-  pthread_exit(NULL);
 }
 
 static void track_thread(rtsp_conn_info *conn) {
@@ -700,12 +653,12 @@ void cleanup_threads(void) {
       debug(2, "Found RTSP connection thread %d in a non-running state.",
             conns[i]->connection_number);
       pthread_join(conns[i]->thread, &retval);
-      debug(2, "Connection %d: deleted in cleanup.", conns[i]->connection_number);
+      debug(2, "Connection %d: deleted.", conns[i]->connection_number);
       free(conns[i]);
       conns[i] = NULL;
     }
     if (conns[i] != NULL) {
-      debug(2, "Airplay Volume for connection %d is %.6f.", conns[i]->connection_number,
+      debug(3, "Airplay Volume for connection %d is %.6f.", conns[i]->connection_number,
             suggested_volume(conns[i]));
       connection_count++;
     }
@@ -721,7 +674,7 @@ void cleanup_threads(void) {
       debug(2, "%d active connections.", connection_count);
     old_connection_count = connection_count;
   }
-  debug(2, "Airplay Volume for new connections is %.6f.", suggested_volume(NULL));
+  debug(3, "Airplay Volume for new connections is %.6f.", suggested_volume(NULL));
 }
 
 // park a null at the line ending, and return the next line pointer
@@ -766,6 +719,11 @@ void msg_retain(rtsp_message *msg) {
 }
 
 rtsp_message *msg_init(void) {
+  // no thread cancellation points here
+  int rc = pthread_mutex_lock(&reference_counter_lock);
+  if (rc)
+    debug(1, "Error %d locking reference counter lock", rc);
+
   rtsp_message *msg = malloc(sizeof(rtsp_message));
   if (msg) {
     memset(msg, 0, sizeof(rtsp_message));
@@ -776,6 +734,11 @@ rtsp_message *msg_init(void) {
     die("msg_init -- can not allocate memory for rtsp_message %d.", msg_indexes);
   }
   // debug(1,"msg_init -- create item %d.", msg->index_number);
+
+  rc = pthread_mutex_unlock(&reference_counter_lock);
+  if (rc)
+    debug(1, "Error %d unlocking reference counter lock", rc);
+
   return msg;
 }
 
@@ -940,7 +903,7 @@ void add_flush_request(int flushNow, uint32_t flushFromSeq, uint32_t flushFromTS
     if ((u == NULL) || ((u->flushNow == 0) && (flushNow != 0)) ||
         (flushFromSeq < u->flushFromSeq) ||
         ((flushFromSeq == u->flushFromSeq) && (flushFromTS < u->flushFromTS))) {
-      flush_request_t *n = (flush_request_t *)calloc(sizeof(flush_request_t), 1);
+      flush_request_t *n = (flush_request_t *)calloc(1, sizeof(flush_request_t));
       n->flushNow = flushNow;
       n->flushFromSeq = flushFromSeq;
       n->flushFromTS = flushFromTS;
@@ -1217,15 +1180,29 @@ ssize_t timed_read_from_rtsp_connection(rtsp_conn_info *conn, uint64_t wait_time
             read_encrypted(conn->fd, &conn->ap2_pairing_context.control_cipher_bundle, buf, count);
       } else {
         result = read(conn->fd, buf, count);
+        if (result == 0) {
+          debug(3, "AP2 read result 0, for a request count of %u.", count);          
+        }
       }
 #else
       result = read(conn->fd, buf, count);
+      if (result == 0) {
+        debug(3, "AP1 read result 0, for a request count of %u.", count);
+        
+      }
 #endif
+      if ((result == 0) && (errno != 0)) {
+        char errorstring[1024];
+        strerror_r(errno, (char *)errorstring, sizeof(errorstring));
+        debug(2, "Connection %d: read result 0, error %d: \"%s\".",
+          conn->connection_number, errno, (char *)errorstring);
+      }
+
       if (wait_time != 0)
         remaining_time = time_to_wait_to - get_absolute_time_in_ns();
-      if (((result == -1) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) && (remaining_time > 0))
+      if ((((result == -1) || (result == 0)) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) && (remaining_time > 0))
         debug(1, "remaining time on a timed read is %" PRId64 " ns.", remaining_time);
-    } while (((result == -1) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) &&
+    } while ((((result == -1) || (result == 0)) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) &&
              (remaining_time > 0));
 
   } else {
@@ -1325,7 +1302,7 @@ enum rtsp_read_request_response rtsp_read_request(rtsp_conn_info *conn, rtsp_mes
       zmq_close(requester);
       zmq_ctx_destroy(zmq_context);
       // a blocking read that returns zero means eof -- implies connection closed by client
-      debug(3, "Connection %d: Connection closed by client.", conn->connection_number);
+      debug(2, "Connection %d: Connection closed by client.", conn->connection_number);
       reply = rtsp_read_request_response_channel_closed;
       // Note: the socket will be closed when the thread exits
       goto shutdown;
@@ -1342,8 +1319,11 @@ enum rtsp_read_request_response rtsp_read_request(rtsp_conn_info *conn, rtsp_mes
         continue;
       }
       if (errno == ETIMEDOUT) {
-        debug(1, "Connection %d: ETIMEDOUT -- keepalive timeout.", conn->connection_number);
-        reply = rtsp_read_request_response_channel_closed;
+        debug(1,
+              "Connection %d: As Yeats almost said, \"Too long a silence / can make a stone "
+              "of the heart\".",
+              conn->connection_number);
+        reply = rtsp_read_request_response_immediate_shutdown_requested;
         // Note: the socket will be closed when the thread exits
         goto shutdown;
       }
@@ -1466,7 +1446,10 @@ enum rtsp_read_request_response rtsp_read_request(rtsp_conn_info *conn, rtsp_mes
   *the_packet = msg;
 shutdown:
   if (reply != rtsp_read_request_response_ok) {
-    msg_free(the_packet);
+    if (*the_packet != NULL) {
+      debug(3, "Freeing the_packet");
+      msg_free(the_packet);
+    }
     release_buffer = 1; // allow the buffer to be released
   }
   pthread_cleanup_pop(release_buffer);
@@ -1526,7 +1509,7 @@ int msg_write_response(rtsp_conn_info *conn, rtsp_message *resp) {
   // Here, if there's content, write the Content-Length header ...
 
   if (resp->contentlength) {
-    debug(2, "Responding with content of length %d", resp->contentlength);
+    debug(3, "Responding with content of length %d", resp->contentlength);
     n = snprintf(p, pktfree, "Content-Length: %d\r\n", resp->contentlength);
     pktfree -= n;
     p += n;
@@ -1668,7 +1651,7 @@ void handle_record(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) 
 
 void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *req,
                      rtsp_message *resp) {
-  debug_log_rtsp_message(2, "GET /info:", req);
+  debug_log_rtsp_message(3, "GET /info:", req);
   if (rtsp_message_contains_plist(req)) { // it's stage one
     // get version of AirPlay -- it might be too old. Not using it yet.
     char *hdr = msg_get_header(req, "User-Agent");
@@ -1677,10 +1660,51 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
         hdr = hdr + strlen("AirPlay/");
         // double airplay_version = 0.0;
         // airplay_version = atof(hdr);
-        debug(2, "Connection %d: GET_INFO: Source AirPlay Version is: %s.", conn->connection_number,
+        debug(3, "Connection %d: GET_INFO: Source AirPlay Version is: %s.", conn->connection_number,
               hdr);
       }
     }
+
+    // In Stage 1, look for the DACP and Active-Remote
+    char *ar = msg_get_header(req, "Active-Remote");
+    if (ar) {
+      debug(3, "Connection %d: GET /info -- Active-Remote string seen: \"%s\".",
+            conn->connection_number, ar);
+      // get the active remote
+      if (conn->dacp_active_remote) // this is in case SETUP was previously called
+        free(conn->dacp_active_remote);
+      conn->dacp_active_remote = strdup(ar);
+#ifdef CONFIG_METADATA
+      send_metadata('ssnc', 'acre', ar, strlen(ar), req, 1);
+#endif
+    } else {
+      debug(3, "Connection %d: GET /info -- doesn't include  Active-Remote information.",
+            conn->connection_number);
+      if (conn->dacp_active_remote) { // this is in case GET /info was previously called
+        free(conn->dacp_active_remote);
+        conn->dacp_active_remote = NULL;
+      }
+    }
+
+    ar = msg_get_header(req, "DACP-ID");
+    if (ar) {
+      debug(3, "Connection %d: GET /info -- DACP-ID string seen: \"%s\".", conn->connection_number,
+            ar);
+      if (conn->dacp_id) // this is in case SETUP was previously called
+        free(conn->dacp_id);
+      conn->dacp_id = strdup(ar);
+#ifdef CONFIG_METADATA
+      send_metadata('ssnc', 'daid', ar, strlen(ar), req, 1);
+#endif
+    } else {
+      debug(3, "Connection %d: GET /info -- doesn't include DACP-ID string information.",
+            conn->connection_number);
+      if (conn->dacp_id) { // this is in case GET /info was previously called
+        free(conn->dacp_id);
+        conn->dacp_id = NULL;
+      }
+    }
+
     plist_t info_plist = NULL;
     plist_from_memory(req->content, req->contentlength, &info_plist);
 
@@ -1700,7 +1724,7 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
       debug(1, "GET /info Stage 1: first item in qualifier array not a string");
       goto user_fail;
     }
-    debug(2, "GET /info Stage 1: qualifier: %s", qualifier_array_val_cstr);
+    debug(3, "GET /info Stage 1: qualifier: %s", qualifier_array_val_cstr);
     plist_free(info_plist);
     free(qualifier_array_val_cstr);
 
@@ -1713,6 +1737,10 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
     } else {
       void *qualifier_response_data = NULL;
       size_t qualifier_response_data_length = 0;
+
+      pthread_rwlock_rdlock(&principal_conn_lock); // don't let the principal_conn be changed
+      pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+
       if (add_pstring_to_malloc("acl=0", &qualifier_response_data,
                                 &qualifier_response_data_length) == 0)
         debug(1, "Problem");
@@ -1775,6 +1803,7 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
       free(vs);
       // pkString_make(pkString, sizeof(pkString), config.airplay_device_id);
       // plist_dict_set_item(response_plist, "pk", plist_new_string(pkString));
+      pthread_cleanup_pop(1); // release the principal_conn lock
       plist_to_bin(response_plist, &resp->content, &resp->contentlength);
       if (resp->contentlength == 0)
         debug(1, "GET /info Stage 1: response bplist not created!");
@@ -1782,7 +1811,7 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
       free(qualifier_response_data);
     }
     msg_add_header(resp, "Content-Type", "application/x-apple-binary-plist");
-    debug_log_rtsp_message(2, "GET /info Stage 1 Response:", resp);
+    debug_log_rtsp_message(3, "GET /info Stage 1 Response:", resp);
     resp->respcode = 200;
     return;
 
@@ -1807,7 +1836,7 @@ void handle_get_info(__attribute((unused)) rtsp_conn_info *conn, rtsp_message *r
     plist_to_bin(response_plist, &resp->content, &resp->contentlength);
     plist_free(response_plist);
     msg_add_header(resp, "Content-Type", "application/x-apple-binary-plist");
-    debug_log_rtsp_message(2, "GET /info Stage 2 Response", resp);
+    debug_log_rtsp_message(3, "GET /info Stage 2 Response", resp);
     resp->respcode = 200;
     return;
   }
@@ -2025,9 +2054,9 @@ void handle_setrateanchori(rtsp_conn_info *conn, rtsp_message *req, rtsp_message
 }
 
 void handle_get(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
-  debug(2, "Connection %d: GET %s :: Content-Length %d", conn->connection_number, req->path,
+  debug(3, "Connection %d: GET %s :: Content-Length %d", conn->connection_number, req->path,
         req->contentlength);
-  debug_log_rtsp_message(2, "GET request", req);
+  debug_log_rtsp_message(3, "GET request", req);
   if (strcmp(req->path, "/info") == 0) {
     handle_get_info(conn, req, resp);
   } else {
@@ -2044,12 +2073,17 @@ void handle_get(__attribute((unused)) rtsp_conn_info *conn, __attribute((unused)
   resp->respcode = 500;
 }
 
-void handle_post(rtsp_conn_info *conn, rtsp_message *req,
-                 __attribute((unused)) rtsp_message *resp) {
-  debug(1, "Connection %d: POST %s Content-Length %d", conn->connection_number, req->path,
-        req->contentlength);
+void handle_post(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
   resp->respcode = 500;
+  if (strcmp(req->path, "/feedback") == 0) {
+    resp->respcode = 501;
+  } else {
+    debug(1, "Connection %d: Airplay 1. Unhandled POST %s Content-Length %d",
+          conn->connection_number, req->path, req->contentlength);
+    debug_log_rtsp_message(2, "POST request", req);
+  }
 }
+
 #endif
 
 #ifdef CONFIG_AIRPLAY_2
@@ -2058,7 +2092,7 @@ struct pairings {
   uint8_t public_key[32];
 
   struct pairings *next;
-} * pairings;
+} *pairings;
 
 static struct pairings *pairing_find(const char *device_id) {
   for (struct pairings *pairing = pairings; pairing; pairing = pairing->next) {
@@ -2185,7 +2219,7 @@ void handle_pair_verify(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *r
   uint8_t *body = NULL;
   size_t body_len = 0;
   struct pair_result *result;
-  debug(2, "Connection %d: pair-verify Content-Length %d", conn->connection_number,
+  debug(3, "Connection %d: pair-verify Content-Length %d", conn->connection_number,
         req->contentlength);
 
   if (!conn->ap2_pairing_context.verify_ctx) {
@@ -2221,7 +2255,7 @@ out:
   resp->contentlength = body_len;
   if (body)
     msg_add_header(resp, "Content-Type", "application/octet-stream");
-  debug_log_rtsp_message(2, "pair-verify response", resp);
+  debug_log_rtsp_message(3, "pair-verify response", resp);
 }
 
 void handle_pair_setup(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
@@ -2267,7 +2301,7 @@ out:
   resp->contentlength = body_len;
   if (body)
     msg_add_header(resp, "Content-Type", "application/octet-stream");
-  debug_log_rtsp_message(2, "pair-setup response", resp);
+  debug_log_rtsp_message(3, "pair-setup response", resp);
 }
 
 void handle_fp_setup(__attribute__((unused)) rtsp_conn_info *conn, rtsp_message *req,
@@ -2410,9 +2444,9 @@ void handle_configure(rtsp_conn_info *conn __attribute__((unused)),
 
 void handle_feedback(rtsp_conn_info *conn, __attribute__((unused)) rtsp_message *req,
                      __attribute__((unused)) rtsp_message *resp) {
-  debug(2, "Connection %d: POST %s Content-Length %d", conn->connection_number, req->path,
+  debug(3, "Connection %d: POST %s Content-Length %d", conn->connection_number, req->path,
         req->contentlength);
-  debug_log_rtsp_message(2, NULL, req);
+  debug_log_rtsp_message(3, NULL, req);
   if (conn->airplay_stream_category == remote_control_stream) {
     plist_t array_plist = plist_new_array();
 
@@ -2423,7 +2457,7 @@ void handle_feedback(rtsp_conn_info *conn, __attribute__((unused)) rtsp_message 
     plist_free(response_plist);
 
     msg_add_header(resp, "Content-Type", "application/x-apple-binary-plist");
-    debug_log_rtsp_message(2, "FEEDBACK response (remote_control_stream):", resp);
+    debug_log_rtsp_message(3, "FEEDBACK response (remote_control_stream):", resp);
   }
 
   /* not finished yet
@@ -2451,7 +2485,7 @@ void handle_command(__attribute__((unused)) rtsp_conn_info *conn, rtsp_message *
                     __attribute__((unused)) rtsp_message *resp) {
   debug(2, "Connection %d: POST %s Content-Length %d", conn->connection_number, req->path,
         req->contentlength);
-  debug_log_rtsp_message(2, NULL, req);
+  debug_log_rtsp_message(3, NULL, req);
   if (rtsp_message_contains_plist(req)) {
     plist_t command_dict = NULL;
     plist_from_memory(req->content, req->contentlength, &command_dict);
@@ -2563,9 +2597,9 @@ void handle_post(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
 }
 
 void handle_setpeers(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
-  debug(2, "Connection %d: SETPEERS %s Content-Length %d", conn->connection_number, req->path,
+  debug(3, "Connection %d: SETPEERS %s Content-Length %d", conn->connection_number, req->path,
         req->contentlength);
-  debug_log_rtsp_message(2, "SETPEERS request", req);
+  debug_log_rtsp_message(3, "SETPEERS request", req);
   /*
     char timing_list_message[4096];
     timing_list_message[0] = 'T';
@@ -2691,29 +2725,39 @@ void teardown_phase_two(rtsp_conn_info *conn) {
 #endif
     }
     conn->groupContainsGroupLeader = 0;
-    config.airplay_statusflags &= (0xffffffff - (1 << 11)); // DeviceSupportsRelay
-    build_bonjour_strings(NULL);
-    debug(2, "Connection %d: TEARDOWN mdns_update on %s.", conn->connection_number,
-          get_category_string(conn->airplay_stream_category));
-    mdns_update(NULL, secondary_txt_records);
     if (conn->dacp_active_remote != NULL) {
       free(conn->dacp_active_remote);
       conn->dacp_active_remote = NULL;
     }
     clear_ptp_clock();
   }
+
+  // only update these things if you're (still) the principal conn
+  pthread_rwlock_wrlock(&principal_conn_lock); // don't let the principal_conn be changed
+  pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+  if (principal_conn == conn) {
+    if (conn->airplay_stream_category == ptp_stream) {
+      config.airplay_statusflags &= (0xffffffff - (1 << 11)); // DeviceSupportsRelay
+      build_bonjour_strings(conn);
+      debug(2, "Connection %d: TEARDOWN mdns_update on %s.", conn->connection_number,
+            get_category_string(conn->airplay_stream_category));
+      mdns_update(NULL, secondary_txt_records);
+    }
+    principal_conn = NULL; // stop being principal_conn
+  }
+  pthread_cleanup_pop(1); // release the principal_conn lock
+  debug(2, "Connection %d: TEARDOWN %s -- close the connection complete", conn->connection_number,
+        get_category_string(conn->airplay_stream_category));
 }
 
 void handle_teardown_2(rtsp_conn_info *conn, __attribute__((unused)) rtsp_message *req,
                        rtsp_message *resp) {
 
-  debug(2, "Connection %d: TEARDOWN %s.", conn->connection_number,
+  debug(2, "Connection %d: TEARDOWN 2 %s.", conn->connection_number,
         get_category_string(conn->airplay_stream_category));
   debug_log_rtsp_message(2, "TEARDOWN: ", req);
-  // if (have_player(conn)) {
   resp->respcode = 200;
   msg_add_header(resp, "Connection", "close");
-
   plist_t messagePlist = plist_from_rtsp_content(req);
   if (messagePlist != NULL) {
     // now see if the incoming plist contains a "streams" array
@@ -2732,51 +2776,54 @@ void handle_teardown_2(rtsp_conn_info *conn, __attribute__((unused)) rtsp_messag
             get_category_string(conn->airplay_stream_category));
       teardown_phase_one(conn); // try to do phase one anyway
       teardown_phase_two(conn);
-      debug(2, "Connection %d: TEARDOWN %s -- close the connection complete",
-            conn->connection_number, get_category_string(conn->airplay_stream_category));
-      release_play_lock(conn);
     }
-
     plist_free(messagePlist);
     resp->respcode = 200;
   } else {
     debug(1, "Connection %d: missing plist!", conn->connection_number);
     resp->respcode = 451; // don't know what to do here
   }
+
   // debug(1,"Bogus exit for valgrind -- remember to comment it out!.");
   // exit(EXIT_SUCCESS); //
 }
 #endif
 
 void teardown(rtsp_conn_info *conn) {
+  debug(2, "Connection %d: TEARDOWN (Classic AirPlay).", conn->connection_number);
   player_stop(conn);
   activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
   if (conn->dacp_active_remote != NULL) {
     free(conn->dacp_active_remote);
     conn->dacp_active_remote = NULL;
   }
+
+  // only update these things if you're (still) the principal conn
+  pthread_rwlock_wrlock(&principal_conn_lock); // don't let the principal_conn be changed
+  pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+  if (principal_conn == conn) {
+#ifdef CONFIG_AIRPLAY_2
+    config.airplay_statusflags &= (0xffffffff - (1 << 11)); // DeviceSupportsRelay
+    build_bonjour_strings(conn);
+    mdns_update(NULL, secondary_txt_records);
+#endif
+    principal_conn = NULL; // stop being principal_conn
+  }
+  pthread_cleanup_pop(1); // release the principal_conn lock
 }
 
 void handle_teardown(rtsp_conn_info *conn, __attribute__((unused)) rtsp_message *req,
                      rtsp_message *resp) {
   debug_log_rtsp_message(2, "TEARDOWN request", req);
   debug(2, "Connection %d: TEARDOWN", conn->connection_number);
-  // if (have_play_lock(conn)) {
   debug(3,
         "TEARDOWN: synchronously terminating the player thread of RTSP conversation thread %d (2).",
         conn->connection_number);
   teardown(conn);
-  release_play_lock(conn);
-
   resp->respcode = 200;
   msg_add_header(resp, "Connection", "close");
   debug(3, "TEARDOWN: successful termination of playing thread of RTSP conversation thread %d.",
         conn->connection_number);
-  //} else {
-  //  warn("Connection %d TEARDOWN received without having the player (no ANNOUNCE?)",
-  //       conn->connection_number);
-  //  resp->respcode = 451;
-  // }
   // debug(1,"Bogus exit for valgrind -- remember to comment it out!.");
   // exit(EXIT_SUCCESS);
 }
@@ -2838,7 +2885,7 @@ static void check_and_send_plist_metadata(plist_t messagePlist, const char *plis
 void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp) {
   int err;
   debug(2, "Connection %d: SETUP (AirPlay 2)", conn->connection_number);
-  debug_log_rtsp_message(2, "SETUP (AirPlay 2) SETUP incoming message", req);
+  debug_log_rtsp_message(3, "SETUP (AirPlay 2) SETUP incoming message", req);
 
   plist_t messagePlist = plist_from_rtsp_content(req);
   plist_t setupResponsePlist = plist_new_dict();
@@ -2941,7 +2988,7 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
                 0) // it should be open already, but just in case it isn't...
               die("Can not access the NQPTP service. Has it stopped running?");
             // clear_ptp_clock();
-            debug_log_rtsp_message(2, "SETUP \"PTP\" message", req);
+            debug_log_rtsp_message(3, "SETUP \"PTP\" message", req);
             plist_t groupUUID = plist_dict_get_item(messagePlist, "groupUUID");
             if (groupUUID) {
               char *gid = NULL;
@@ -3020,7 +3067,8 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
                 // debug(1, "Interface index %d, name: \"%s\"",if_nametoindex(iap->ifa_name),
                 // iap->ifa_name);
                 if ((iap->ifa_addr) && (iap->ifa_netmask) && (iap->ifa_flags & IFF_UP) &&
-                    ((iap->ifa_flags & IFF_LOOPBACK) == 0)) {
+                    ((iap->ifa_flags & IFF_LOOPBACK) == 0) &&
+                    (config.interface == NULL || (strcmp(config.interface, iap->ifa_name) == 0))) {
                   char buf[INET6_ADDRSTRLEN + 1]; // +1 for a NUL
                   memset(buf, 0, sizeof(buf));
                   if (iap->ifa_addr->sa_family == AF_INET6) {
@@ -3093,12 +3141,19 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
                                                   conn->connection_number); // kill all the other
                  listeners
               */
+              // only update these things if you're (still) the principal conn
+              pthread_rwlock_wrlock(
+                  &principal_conn_lock); // don't let the principal_conn be changed
+              pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+              if (principal_conn == conn) {
+                config.airplay_statusflags |= 1 << 11; // DeviceSupportsRelay
+                build_bonjour_strings(conn);
+                debug(2, "Connection %d: SETUP mdns_update on %s.", conn->connection_number,
+                      get_category_string(conn->airplay_stream_category));
+                mdns_update(NULL, secondary_txt_records);
+              }
+              pthread_cleanup_pop(1); // release the principal_conn lock
 
-              config.airplay_statusflags |= 1 << 11; // DeviceSupportsRelay
-              build_bonjour_strings(conn);
-              debug(2, "Connection %d: SETUP mdns_update on %s.", conn->connection_number,
-                    get_category_string(conn->airplay_stream_category));
-              mdns_update(NULL, secondary_txt_records);
               resp->respcode = 200;
             } else {
               debug(1, "SETUP on Connection %d: PTP setup -- no timingPeerInfo plist.",
@@ -3420,7 +3475,7 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
   plist_free(messagePlist);
   if (clientNameString != NULL)
     free(clientNameString);
-  debug_log_rtsp_message(2, " SETUP response", resp);
+  debug_log_rtsp_message(3, " SETUP response", resp);
 }
 #endif
 
@@ -3592,8 +3647,8 @@ void handle_set_parameter_parameter(rtsp_conn_info *conn, rtsp_message *req,
         shairport_sync_set_volume(shairportSyncSkeleton, volume);
       } else {
 #endif
-        pthread_cleanup_debug_mutex_lock(&principal_conn_lock, 100000,
-                                         1); // don't let the principal_conn be changed
+        pthread_rwlock_rdlock(&principal_conn_lock); // don't let the principal_conn be changed
+        pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
         if (principal_conn == conn) {
           player_volume(volume, conn);
         }
@@ -4009,13 +4064,9 @@ void metadata_pack_cleanup_function(void *arg) {
 void metadata_thread_cleanup_function(__attribute__((unused)) void *arg) {
   // debug(2, "metadata_thread_cleanup_function called");
   metadata_close();
-  pc_queue_delete(&metadata_queue);
 }
 
 void *metadata_thread_function(__attribute__((unused)) void *ignore) {
-  // create a pc_queue for passing information to a threaded metadata handler
-  pc_queue_init(&metadata_queue, (char *)&metadata_queue_items, sizeof(metadata_package),
-                metadata_queue_size, "pipe");
   metadata_create_multicast_socket();
   metadata_package pack;
   pthread_cleanup_push(metadata_thread_cleanup_function, NULL);
@@ -4041,13 +4092,9 @@ void *metadata_thread_function(__attribute__((unused)) void *ignore) {
 void metadata_multicast_thread_cleanup_function(__attribute__((unused)) void *arg) {
   // debug(2, "metadata_multicast_thread_cleanup_function called");
   metadata_delete_multicast_socket();
-  pc_queue_delete(&metadata_multicast_queue);
 }
 
 void *metadata_multicast_thread_function(__attribute__((unused)) void *ignore) {
-  // create a pc_queue for passing information to a threaded metadata handler
-  pc_queue_init(&metadata_multicast_queue, (char *)&metadata_multicast_queue_items,
-                sizeof(metadata_package), metadata_multicast_queue_size, "multicast");
   metadata_create_multicast_socket();
   metadata_package pack;
   pthread_cleanup_push(metadata_multicast_thread_cleanup_function, NULL);
@@ -4082,13 +4129,9 @@ void metadata_hub_close(void) {}
 void metadata_hub_thread_cleanup_function(__attribute__((unused)) void *arg) {
   // debug(2, "metadata_hub_thread_cleanup_function called");
   metadata_hub_close();
-  pc_queue_delete(&metadata_hub_queue);
 }
 
 void *metadata_hub_thread_function(__attribute__((unused)) void *ignore) {
-  // create a pc_queue for passing information to a threaded metadata handler
-  pc_queue_init(&metadata_hub_queue, (char *)&metadata_hub_queue_items, sizeof(metadata_package),
-                metadata_hub_queue_size, "hub");
   metadata_package pack;
   pthread_cleanup_push(metadata_hub_thread_cleanup_function, NULL);
   while (1) {
@@ -4116,14 +4159,10 @@ void metadata_mqtt_close(void) {}
 void metadata_mqtt_thread_cleanup_function(__attribute__((unused)) void *arg) {
   // debug(2, "metadata_mqtt_thread_cleanup_function called");
   metadata_mqtt_close();
-  pc_queue_delete(&metadata_mqtt_queue);
   // debug(2, "metadata_mqtt_thread_cleanup_function done");
 }
 
 void *metadata_mqtt_thread_function(__attribute__((unused)) void *ignore) {
-  // create a pc_queue for passing information to a threaded metadata handler
-  pc_queue_init(&metadata_mqtt_queue, (char *)&metadata_mqtt_queue_items, sizeof(metadata_package),
-                metadata_mqtt_queue_size, "mqtt");
   metadata_package pack;
   pthread_cleanup_push(metadata_mqtt_thread_cleanup_function, NULL);
   while (1) {
@@ -4170,24 +4209,39 @@ void metadata_init(void) {
     if ((fd == -1) && (errno != ENXIO)) {
       char errorstring[1024];
       strerror_r(errno, (char *)errorstring, sizeof(errorstring));
-      debug(1, "metadata_hub_thread_function -- error %d (\"%s\") opening pipe: \"%s\".", errno,
+      debug(1, "metadata_init -- error %d (\"%s\") opening pipe: \"%s\".", errno,
             (char *)errorstring, path);
       warn("can not open metadata pipe -- error %d (\"%s\") opening pipe: \"%s\".", errno,
            (char *)errorstring, path);
     }
     free(path);
+
+    // initialise the metadata queues first, otherwise the might be a race condition
+    // create a pc_queue for the metadata pipe
+    pc_queue_init(&metadata_queue, (char *)&metadata_queue_items, sizeof(metadata_package),
+                  metadata_queue_size, "pipe");
+
     if (pthread_create(&metadata_thread, NULL, metadata_thread_function, NULL) != 0)
       debug(1, "Failed to create metadata thread!");
 
+    // create a pc_queue for the metadata_multicast_queue
+    pc_queue_init(&metadata_multicast_queue, (char *)&metadata_multicast_queue_items,
+                  sizeof(metadata_package), metadata_multicast_queue_size, "multicast");
     if (pthread_create(&metadata_multicast_thread, NULL, metadata_multicast_thread_function,
                        NULL) != 0)
       debug(1, "Failed to create metadata multicast thread!");
   }
 #ifdef CONFIG_METADATA_HUB
+  // create a pc_queue for the metadata hub
+  pc_queue_init(&metadata_hub_queue, (char *)&metadata_hub_queue_items, sizeof(metadata_package),
+                metadata_hub_queue_size, "hub");
   if (pthread_create(&metadata_hub_thread, NULL, metadata_hub_thread_function, NULL) != 0)
     debug(1, "Failed to create metadata hub thread!");
 #endif
 #ifdef CONFIG_MQTT
+  // create a pc_queue for the MQTT handler
+  pc_queue_init(&metadata_mqtt_queue, (char *)&metadata_mqtt_queue_items, sizeof(metadata_package),
+                metadata_mqtt_queue_size, "mqtt");
   if (pthread_create(&metadata_mqtt_thread, NULL, metadata_mqtt_thread_function, NULL) != 0)
     debug(1, "Failed to create metadata mqtt thread!");
 #endif
@@ -4201,6 +4255,7 @@ void metadata_stop(void) {
     // debug(2, "metadata stop mqtt thread.");
     pthread_cancel(metadata_mqtt_thread);
     pthread_join(metadata_mqtt_thread, NULL);
+    pc_queue_delete(&metadata_mqtt_queue);
     // debug(2, "metadata stop mqtt done.");
 #endif
 #ifdef CONFIG_METADATA_HUB
@@ -4208,6 +4263,7 @@ void metadata_stop(void) {
     pthread_cancel(metadata_hub_thread);
     pthread_join(metadata_hub_thread, NULL);
     // debug(2, "metadata stop hub done.");
+    pc_queue_delete(&metadata_hub_queue);
 #endif
     if (config.metadata_enabled) {
       // debug(2, "metadata stop multicast thread.");
@@ -4215,12 +4271,14 @@ void metadata_stop(void) {
         pthread_cancel(metadata_multicast_thread);
         pthread_join(metadata_multicast_thread, NULL);
         // debug(2, "metadata stop multicast done.");
+        pc_queue_delete(&metadata_multicast_queue);
       }
       if (metadata_thread) {
         // debug(2, "metadata stop metadata_thread thread.");
         pthread_cancel(metadata_thread);
         pthread_join(metadata_thread, NULL);
         // debug(2, "metadata_stop finished successfully.");
+        pc_queue_delete(&metadata_queue);
       }
     }
   }
@@ -4271,6 +4329,8 @@ int send_metadata_to_queue(pc_queue *queue, uint32_t type, uint32_t code, char *
     if (data)
       pack.data = memdup(data, length); // only if it's not a null
   }
+
+  // debug(1, "send_metadata_to_queue %x/%x", type, code);
   int rc = pc_queue_add_item(queue, &pack, block);
   if (rc != 0) {
     if (pack.carrier) {
@@ -4495,7 +4555,22 @@ static void handle_announce(rtsp_conn_info *conn, rtsp_message *req, rtsp_messag
 #ifdef CONFIG_AIRPLAY_2
     conn->airplay_type = ap_1;
     conn->timing_type = ts_ntp;
-    debug(2, "Connection %d: Classic AirPlay connection from %s:%u to self at %s:%u.",
+    if (conn->airplay_gid != NULL) {
+      free(conn->airplay_gid);
+      conn->airplay_gid = NULL;
+    }
+
+    // only update these things if you're (still) the principal conn
+    pthread_rwlock_rdlock(&principal_conn_lock); // don't let the principal_conn be changed
+    pthread_cleanup_push(rwlock_unlock, (void *)&principal_conn_lock);
+    if (principal_conn == conn) {
+      config.airplay_statusflags |= 1 << 11; // DeviceSupportsRelay -- should this be on?
+      build_bonjour_strings(conn);
+      mdns_update(NULL, secondary_txt_records);
+    }
+    pthread_cleanup_pop(1); // release the principal_conn lock
+
+    debug(1, "Connection %d: Classic AirPlay connection from %s:%u to self at %s:%u.",
           conn->connection_number, conn->client_ip_string, conn->client_rtsp_port,
           conn->self_ip_string, conn->self_rtsp_port);
 #endif
@@ -5020,8 +5095,7 @@ void rtsp_conversation_thread_cleanup_function(void *arg) {
   if (conn != NULL) {
     int oldState;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
-
-    debug(2, "Connection %d: %s rtsp_conversation_thread_func_cleanup_function called.",
+    debug(3, "Connection %d: %s rtsp_conversation_thread_func_cleanup_function called.",
           conn->connection_number, get_category_string(conn->airplay_stream_category));
 #ifdef CONFIG_AIRPLAY_2
     // AP2
@@ -5113,15 +5187,8 @@ void rtsp_conversation_thread_cleanup_function(void *arg) {
     if (rc)
       debug(1, "Connection %d: error %d destroying flush_mutex.", conn->connection_number, rc);
 
-    debug(3, "Cancel watchdog thread.");
-    pthread_cancel(conn->player_watchdog_thread);
-    debug(3, "Join watchdog thread.");
-    pthread_join(conn->player_watchdog_thread, NULL);
-    debug(3, "Delete watchdog mutex.");
-    pthread_mutex_destroy(&conn->watchdog_mutex);
-
-    debug(2, "Connection %d: Closed.", conn->connection_number);
-    conn->running = 0;
+    debug(3, "Connection %d: Closed.", conn->connection_number);
+    conn->running = 0; // for the garbage collector
     pthread_setcancelstate(oldState, NULL);
   }
 }
@@ -5133,11 +5200,6 @@ void msg_cleanup_function(void *arg) {
 
 static void *rtsp_conversation_thread_func(void *pconn) {
   rtsp_conn_info *conn = pconn;
-
-  // create the watchdog mutex, initialise the watchdog time and start the watchdog thread;
-  conn->watchdog_bark_time = get_absolute_time_in_ns();
-  pthread_mutex_init(&conn->watchdog_mutex, NULL);
-  pthread_create(&conn->player_watchdog_thread, NULL, &player_watchdog_thread_code, (void *)conn);
 
   int rc = pthread_mutex_init(&conn->flush_mutex, NULL);
   if (rc)
@@ -5174,7 +5236,19 @@ static void *rtsp_conversation_thread_func(void *pconn) {
 #endif
 
   while (conn->stop == 0) {
-    int debug_level = 2; // for printing the request and response
+    int debug_level = 3; // for printing the request and response
+
+    // check to see if a conn has been zeroed
+
+    debug_mutex_lock(&conns_lock, 1000000, 3);
+    int i;
+    for (i = 0; i < nconns; i++) {
+      if ((conns[i] != NULL) && (conns[i]->connection_number == 0)) {
+        debug(1, "conns[%d] at %" PRIxPTR " has a Connection Number of 0!", i, conns[i]);
+      }
+    }
+    debug_mutex_unlock(&conns_lock, 3);
+
     reply = rtsp_read_request(conn, &req);
     if (reply == rtsp_read_request_response_ok) {
       pthread_cleanup_push(msg_cleanup_function, (void *)&req);
@@ -5245,7 +5319,7 @@ static void *rtsp_conversation_thread_func(void *pconn) {
               obfp += 2;
             };
             *obfp = 0;
-            debug(2, "Content: \"%s\".", obf);
+            debug(dl, "Content: \"%s\".", obf);
           }
         }
       }
@@ -5476,7 +5550,7 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
         maxfd = sockfd[i];
     }
 
-    char **t1 = txt_records; // ap1 test records
+    char **t1 = txt_records; // ap1 text records
     char **t2 = NULL;        // possibly two text records
 #ifdef CONFIG_AIRPLAY_2
     // make up a secondary set of text records
@@ -5521,11 +5595,15 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
       if (acceptfd < 0) // timeout
         continue;
 
+      int release_conn = 1; // on exit, deallocate the buffer unless everything was okay
+
       rtsp_conn_info *conn = malloc(sizeof(rtsp_conn_info));
       if (conn == 0)
         die("Couldn't allocate memory for an rtsp_conn_info record.");
+      pthread_cleanup_push(malloc_cleanup, conn);
       memset(conn, 0, sizeof(rtsp_conn_info));
       conn->connection_number = RTSP_connection_index++;
+      // debug(2, "Connection %d is at: 0x%" PRIxPTR ".", conn->connection_number, conn);
 #ifdef CONFIG_AIRPLAY_2
       conn->airplay_type = ap_2;  // changed if an ANNOUNCE is received
       conn->timing_type = ts_ptp; // changed if an ANNOUNCE is received
@@ -5537,46 +5615,64 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
         debug(1, "Connection %d: New connection on port %d not accepted:", conn->connection_number,
               config.port);
         perror("failed to accept connection");
-        free(conn);
       } else {
         size_of_reply = sizeof(SOCKADDR);
         if (getsockname(conn->fd, (struct sockaddr *)&conn->local, &size_of_reply) == 0) {
 
-          // Thanks to https://holmeshe.me/network-essentials-setsockopt-SO_KEEPALIVE/ for this.
+          if ((config.dont_check_timeout == 0) && (config.timeout != 0)) {
+// skip this stuff in OpenBSD
+#ifndef COMPILE_FOR_OPENBSD
+            // Thanks to https://holmeshe.me/network-essentials-setsockopt-SO_KEEPALIVE/ for this.
 
-          // turn on keepalive stuff -- wait for keepidle + (keepcnt * keepinttvl time) seconds
-          // before giving up an ETIMEOUT error is returned if the keepalive check fails
+            // turn on keepalive stuff -- wait for keepidle + (keepcnt * keepinttvl time) seconds
+            // before giving up an ETIMEOUT error is returned if the keepalive check fails
 
-          int keepAliveIdleTime = 35; // wait this many seconds before checking for a dropped client
-          int keepAliveCount = 5;     // check this many times
-          int keepAliveInterval = 5;  // wait this many seconds between checks
+            // if TCP_KEEPINTVL is defined, check a few times before declaring the line dead
+            // otherwise just wait a little while longer
 
+#ifdef TCP_KEEPINTVL
+            int keepAliveIdleTime =
+                config.timeout -
+                5 * 5;              // wait this many seconds before checking for a dropped client
+            int keepAliveCount = 5; // check this many times
+            int keepAliveInterval = 5; // wait this many seconds between checks
+#else
+            int keepAliveIdleTime =
+                config.timeout; // wait this many seconds before dropping a client
+#endif
+
+// --- the following is a bit  too complicated
+// decide to use IPPROTO_TCP or SOL_TCP
 #if defined COMPILE_FOR_BSD || defined COMPILE_FOR_OSX
 #define SOL_OPTION IPPROTO_TCP
 #else
 #define SOL_OPTION SOL_TCP
 #endif
-
+// decide to use TCP_KEEPALIVE or TCP_KEEPIDLE
 #ifdef COMPILE_FOR_OSX
 #define KEEP_ALIVE_OR_IDLE_OPTION TCP_KEEPALIVE
 #else
 #define KEEP_ALIVE_OR_IDLE_OPTION TCP_KEEPIDLE
 #endif
 
-          if (setsockopt(conn->fd, SOL_OPTION, KEEP_ALIVE_OR_IDLE_OPTION,
-                         (void *)&keepAliveIdleTime, sizeof(keepAliveIdleTime))) {
-            debug(1, "can't set the keepidle wait time");
+            if (setsockopt(conn->fd, SOL_OPTION, KEEP_ALIVE_OR_IDLE_OPTION,
+                           (void *)&keepAliveIdleTime, sizeof(keepAliveIdleTime))) {
+              debug(1, "can't set the keepAliveIdleTime wait time");
+            }
+// ---
+// if TCP_KEEPINTVL is defined...
+#ifdef TCP_KEEPINTVL
+            if (setsockopt(conn->fd, SOL_OPTION, TCP_KEEPCNT, (void *)&keepAliveCount,
+                           sizeof(keepAliveCount))) {
+              debug(1, "can't set the keepAliveCount count");
+            }
+            if (setsockopt(conn->fd, SOL_OPTION, TCP_KEEPINTVL, (void *)&keepAliveInterval,
+                           sizeof(keepAliveInterval))) {
+              debug(1, "can't set the keepAliveCount count interval");
+            };
+#endif
+#endif
           }
-
-          if (setsockopt(conn->fd, SOL_OPTION, TCP_KEEPCNT, (void *)&keepAliveCount,
-                         sizeof(keepAliveCount))) {
-            debug(1, "can't set the keepidle missing count");
-          }
-          if (setsockopt(conn->fd, SOL_OPTION, TCP_KEEPINTVL, (void *)&keepAliveInterval,
-                         sizeof(keepAliveInterval))) {
-            debug(1, "can't set the keepidle missing count interval");
-          };
-
           // initialise the connection info
           void *client_addr = NULL, *self_addr = NULL;
           conn->connection_ip_family = conn->local.SAFAMILY;
@@ -5627,13 +5723,15 @@ void *rtsp_listen_loop(__attribute((unused)) void *arg) {
         debug(3, "Successfully created RTSP receiver thread %d.", conn->connection_number);
         conn->running = 1; // this must happen before the thread is tracked
         track_thread(conn);
+        release_conn = 0; // successfully initialised
       }
+      pthread_cleanup_pop(release_conn); // release the conn malloc if any kind of error
     } while (1);
     pthread_cleanup_pop(1); // should never happen
   } else {
-    warn("could not establish a service on port %d -- program terminating. Is another instance of "
-         "Shairport Sync running on this device?",
-         config.port);
+    die("could not establish a service on port %d -- program terminating. Is another instance of "
+        "Shairport Sync running on this device?",
+        config.port);
   }
   debug(1, "Oops -- fell out of the RTSP select loop");
   pthread_exit(NULL);

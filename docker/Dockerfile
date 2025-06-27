@@ -1,11 +1,7 @@
-FROM alpine:3.17 AS builder
+ARG NQPTP_BRANCH=main
+ARG SHAIRPORT_SYNC_BRANCH=.
 
-# Check required arguments exist. These will be provided by the Github Action
-# Workflow and are required to ensure the correct branches are being used.
-ARG SHAIRPORT_SYNC_BRANCH
-RUN test -n "$SHAIRPORT_SYNC_BRANCH"
-ARG NQPTP_BRANCH
-RUN test -n "$NQPTP_BRANCH"
+FROM alpine:3.20 AS builder
 
 RUN apk -U add \
         alsa-lib-dev \
@@ -23,6 +19,7 @@ RUN apk -U add \
         libsndfile-dev \
         libsodium-dev \
         libtool \
+        pipewire-dev \
         mosquitto-dev \
         popt-dev \
         pulseaudio-dev \
@@ -30,42 +27,70 @@ RUN apk -U add \
         xxd
 
 ##### ALAC #####
-RUN git clone https://github.com/mikebrady/alac
+FROM builder AS alac
+RUN git clone --depth=1 https://github.com/mikebrady/alac
 WORKDIR /alac
 RUN autoreconf -i
 RUN ./configure
-RUN make
+RUN make -j $(nproc)
 RUN make install
 WORKDIR /
 ##### ALAC END #####
 
 ##### NQPTP #####
-RUN git clone https://github.com/mikebrady/nqptp
+FROM builder AS nqptp
+ARG NQPTP_BRANCH
+RUN git clone --depth=1 -b "$NQPTP_BRANCH" https://github.com/mikebrady/nqptp
 WORKDIR /nqptp
-RUN git checkout "$NQPTP_BRANCH"
 RUN autoreconf -i
 RUN ./configure
-RUN make
+RUN make -j $(nproc)
 WORKDIR /
 ##### NQPTP END #####
 
 ##### SPS #####
+# Note: apple-alac requires alac build first.
+FROM alac AS shairport-sync
+ARG SHAIRPORT_SYNC_BRANCH
+
 WORKDIR /shairport-sync
 COPY . .
 RUN git checkout "$SHAIRPORT_SYNC_BRANCH"
 WORKDIR /shairport-sync/build
 RUN autoreconf -i ../
-RUN ../configure --sysconfdir=/etc --with-alsa --with-pa --with-soxr --with-avahi --with-ssl=openssl \
+RUN CFLAGS="-O3" CXXFLAGS="-O3" ../configure --sysconfdir=/etc --with-alsa --with-pa --with-soxr --with-avahi --with-ssl=openssl \
         --with-airplay-2 --with-metadata --with-dummy --with-pipe --with-dbus-interface \
         --with-stdout --with-mpris-interface --with-mqtt-client \
-        --with-apple-alac --with-convolution
+        --with-apple-alac --with-convolution --with-pw
 RUN make -j $(nproc)
 RUN DESTDIR=install make install
 WORKDIR /
 ##### SPS END #####
 
+##### STATIC FILES #####
+FROM scratch AS files
+
+# Add run script that will start SPS
+COPY --chmod=755 ./docker/run.sh ./run.sh
+COPY ./docker/etc/s6-overlay/s6-rc.d /etc/s6-overlay/s6-rc.d
+COPY ./docker/etc/pulse /etc/pulse
+##### END STATIC FILES #####
+
+##### BUILD FILES #####
+FROM scratch AS build-files
+
+COPY --from=shairport-sync /shairport-sync/build/install/usr/local/bin/shairport-sync /usr/local/bin/shairport-sync
+COPY --from=shairport-sync /shairport-sync/build/install/usr/local/share/man/man1 /usr/share/man/man1
+COPY --from=nqptp /nqptp/nqptp /usr/local/bin/nqptp
+COPY --from=alac /usr/local/lib/libalac.* /usr/local/lib/
+COPY --from=shairport-sync /shairport-sync/build/install/etc/shairport-sync.conf /etc/
+COPY --from=shairport-sync /shairport-sync/build/install/etc/shairport-sync.conf.sample /etc/
+COPY --from=shairport-sync /shairport-sync/build/install/etc/dbus-1/system.d/shairport-sync-dbus.conf /etc/dbus-1/system.d/
+COPY --from=shairport-sync /shairport-sync/build/install/etc/dbus-1/system.d/shairport-sync-mpris.conf /etc/dbus-1/system.d/
+##### END BUILD FILES #####
+
 # Shairport Sync Runtime System
-FROM crazymax/alpine-s6:3.17-3.1.1.2
+FROM crazymax/alpine-s6:3.20-3.2.0.2
 
 ENV S6_CMD_WAIT_FOR_SERVICES=1
 ENV S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0
@@ -83,44 +108,35 @@ RUN apk -U add \
         libgcrypt \
         libplist \
         libpulse \
-        libressl3.6-libcrypto \
+        libressl3.8-libcrypto \
         libsndfile \
         libsodium \
         libuuid \
+        pipewire \
         man-pages \
         mandoc \
         mosquitto \
         popt \
-        soxr
+        soxr \
+        curl
 
-# Copy build files.
-COPY --from=builder /shairport-sync/build/install/usr/local/bin/shairport-sync /usr/local/bin/shairport-sync
-COPY --from=builder /shairport-sync/build/install/usr/local/share/man/man7 /usr/share/man/man7
-COPY --from=builder /nqptp/nqptp /usr/local/bin/nqptp
-COPY --from=builder /usr/local/lib/libalac.* /usr/local/lib/
-COPY --from=builder /shairport-sync/build/install/etc/shairport-sync.conf /etc/
-COPY --from=builder /shairport-sync/build/install/etc/shairport-sync.conf.sample /etc/
-COPY --from=builder /shairport-sync/build/install/etc/dbus-1/system.d/shairport-sync-dbus.conf /etc/dbus-1/system.d/
-COPY --from=builder /shairport-sync/build/install/etc/dbus-1/system.d/shairport-sync-mpris.conf /etc/dbus-1/system.d/
+RUN rm -rfv /lib/apk/db/* && \
+    rm -rfv /etc/avahi/services/*.service && \
+    addgroup shairport-sync && \
+    adduser -D shairport-sync -G shairport-sync && \
+    addgroup -g 29 docker_audio && \
+    addgroup shairport-sync docker_audio && \
+    addgroup shairport-sync audio && \
+    mkdir -p /run/dbus
 
-COPY ./docker/etc/s6-overlay/s6-rc.d /etc/s6-overlay/s6-rc.d
-COPY ./docker/etc/pulse /etc/pulse
-RUN chmod +x /etc/s6-overlay/s6-rc.d/01-startup/script.sh
+# Remove anything we don't need.
+# Remove any statically-defined Avahi services, e.g. SSH and SFTP
 
 # Create non-root user for running the container -- running as the user 'shairport-sync' also allows
 # Shairport Sync to provide the D-Bus and MPRIS interfaces within the container
-
-RUN addgroup shairport-sync
-RUN adduser -D shairport-sync -G shairport-sync
-
 # Add the shairport-sync user to the pre-existing audio group, which has ID 29, for access to the ALSA stuff
-RUN addgroup -g 29 docker_audio && addgroup shairport-sync docker_audio && addgroup shairport-sync audio
 
-# Remove anything we don't need.
-RUN rm -rf /lib/apk/db/*
+COPY --from=files / /
+COPY --from=build-files / /
 
-# Add run script that will start SPS
-COPY ./docker/run.sh ./run.sh
-RUN chmod +x /run.sh
-
-Entrypoint ["/init","./run.sh"]
+ENTRYPOINT ["/init","./run.sh"]

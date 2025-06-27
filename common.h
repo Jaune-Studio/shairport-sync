@@ -139,9 +139,17 @@ typedef struct {
   char *pa_server;           // the pulseaudio server address that Shairport Sync will play on.
   char *pa_application_name; // the name under which Shairport Sync shows up as an "Application" in
                              // the Sound Preferences in most desktop Linuxes.
-  // Defaults to "Shairport Sync". Shairport Sync must be playing to see it.
+  // Defaults to "Shairport Sync".
 
   char *pa_sink; // the name (or id) of the sink that Shairport Sync will play on.
+#endif
+#ifdef CONFIG_PW
+  char *pw_application_name;  // the name under which Shairport Sync shows up as an "Application" in
+                              // the Sound Preferences in most desktop Linuxes.
+                              // Defaults to "Shairport Sync".
+
+  char *pw_node_name; // defaults to the application's name, usually "shairport-sync".
+  char *pw_sink_target; // leave this unset if you don't want to change the sink_target.
 #endif
 #ifdef CONFIG_METADATA
   int metadata_enabled;
@@ -167,6 +175,8 @@ typedef struct {
   int mqtt_publish_parsed;
   int mqtt_publish_cover;
   int mqtt_enable_remote;
+  int mqtt_enable_autodiscovery;
+  char *mqtt_autodiscovery_prefix;
   char *mqtt_empty_payload_substitute;
 #endif
   uint8_t ap1_prefix[6];
@@ -374,11 +384,14 @@ void _die(const char *filename, const int linenumber, const char *format, ...);
 void _warn(const char *filename, const int linenumber, const char *format, ...);
 void _inform(const char *filename, const int linenumber, const char *format, ...);
 void _debug(const char *filename, const int linenumber, int level, const char *format, ...);
+void _debug_print_buffer(const char *thefilename, const int linenumber, int level, void *buf,
+                         size_t buf_len);
 
 #define die(...) _die(__FILE__, __LINE__, __VA_ARGS__)
 #define debug(...) _debug(__FILE__, __LINE__, __VA_ARGS__)
 #define warn(...) _warn(__FILE__, __LINE__, __VA_ARGS__)
 #define inform(...) _inform(__FILE__, __LINE__, __VA_ARGS__)
+#define debug_print_buffer(...) _debug_print_buffer(__FILE__, __LINE__, __VA_ARGS__)
 
 uint8_t *base64_dec(char *input, int *outlen);
 char *base64_enc(uint8_t *input, int length);
@@ -495,6 +508,7 @@ uint16_t bind_UDP_port(int ip_family, const char *self_ip_address, uint32_t scop
 
 void socket_cleanup(void *arg);
 void mutex_unlock(void *arg);
+void rwlock_unlock(void *arg);
 void mutex_cleanup(void *arg);
 void cv_cleanup(void *arg);
 void thread_cleanup(void *arg);
