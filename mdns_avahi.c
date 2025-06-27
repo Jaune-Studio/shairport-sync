@@ -46,6 +46,7 @@
 
 #include <avahi-client/lookup.h>
 #include <avahi-common/alternative.h>
+#include <zmq.h>
 
 void threaded_poll_unlock(void *arg) { avahi_threaded_poll_unlock((AvahiThreadedPoll *)arg); }
 
@@ -193,21 +194,39 @@ static void egroup_callback(AvahiEntryGroup *g, AvahiEntryGroupState state,
 
   case AVAHI_ENTRY_GROUP_COLLISION: {
     char *n;
+    char command[100];
+    uint8_t i;
+    uint8_t size = 0;
+    void *zmq_context = zmq_ctx_new();
+    void *requester = zmq_socket(zmq_context, ZMQ_REQ);
+    zmq_connect(requester, "tcp://localhost:5556");
+
+    n = avahi_alternative_host_name(config.service_name);
+    debug(2, "avahi: hostname collision, renaming to '%s'", n);
+    strcpy(command, "Shairport rename ");
+    strcat(command, n);
+    for(i=0; command[i]!='\0'; i++)
+    {
+        size++;
+    }
+    zmq_send(requester, command, size, 0);
+    zmq_close(requester);
+    zmq_ctx_destroy(zmq_context);
 
     /* A service name collision with a remote service
      * happened. Let's pick a new name */
-    debug(1, "avahi name collision -- look for another");
-    n = avahi_alternative_service_name(service_name);
-    if (service_name)
-      avahi_free(service_name);
-    else
-      debug(1, "avahi attempt to free a NULL service name");
-    service_name = n;
+    // debug(1, "avahi name collision -- look for another");
+    // n = avahi_alternative_service_name(service_name);
+    // if (service_name)
+    //   avahi_free(service_name);
+    // else
+    //   debug(1, "avahi attempt to free a NULL service name");
+    // service_name = n;
 
-    debug(2, "avahi: service name collision, renaming service to '%s'", service_name);
+    // debug(2, "avahi: service name collision, renaming service to '%s'", service_name);
 
-    /* And try to recreate the services */
-    register_service(avahi_entry_group_get_client(g));
+    // /* And recreate the services */
+    // register_service(avahi_entry_group_get_client(g));
     break;
   }
 

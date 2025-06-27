@@ -103,6 +103,7 @@
 #endif
 
 #include "mdns.h"
+#include <zmq.h>
 
 // mDNS advertisement strings
 
@@ -1294,6 +1295,12 @@ enum rtsp_read_request_response rtsp_read_request(rtsp_conn_info *conn, rtsp_mes
     nread = read_from_rtsp_connection(conn, buf + inbuf, buflen - inbuf);
 
     if (nread == 0) {
+      void *zmq_context = zmq_ctx_new();
+      void *requester = zmq_socket(zmq_context, ZMQ_REQ);
+      zmq_connect(requester, "tcp://localhost:5556");
+      zmq_send(requester, "Shairport connected false", 25, 0);
+      zmq_close(requester);
+      zmq_ctx_destroy(zmq_context);
       // a blocking read that returns zero means eof -- implies connection closed by client
       debug(2, "Connection %d: Connection closed by client.", conn->connection_number);
       reply = rtsp_read_request_response_channel_closed;
@@ -2910,6 +2917,12 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
       plist_get_string_val(timingProtocol, &timingProtocolString);
       if (timingProtocolString) {
         if (strcmp(timingProtocolString, "PTP") == 0) {
+          void *zmq_context = zmq_ctx_new();
+          void *requester = zmq_socket(zmq_context, ZMQ_REQ);
+          zmq_connect(requester, "tcp://localhost:5556");
+          zmq_send(requester, "Shairport connected true", 24, 0);
+          zmq_close(requester);
+          zmq_ctx_destroy(zmq_context);
           debug(1, "Connection %d: AP2 PTP connection from %s:%u (\"%s\") to self at %s:%u.",
                 conn->connection_number, conn->client_ip_string, conn->client_rtsp_port,
                 clientNameString, conn->self_ip_string, conn->self_rtsp_port);

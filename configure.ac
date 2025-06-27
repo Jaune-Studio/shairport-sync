@@ -39,6 +39,7 @@ AC_PROG_INSTALL
 PKG_PROG_PKG_CONFIG([0.9.0])
 
 # Checks for libraries.
+AC_CHECK_LIB(zmq, zmq_socket,,[echo -e "\tPlease install libzmq3-dev)";exit])
 if test "x${with_os}" = xlinux -o "x${with_os}" = xfreebsd ; then
  AC_CHECK_LIB([rt],[clock_gettime], , AC_MSG_ERROR(librt needed))
 fi

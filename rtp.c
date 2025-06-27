@@ -52,6 +52,7 @@
 #include <libswresample/swresample.h>
 #include <sodium.h>
 #endif
+#include <zmq.h>
 
 struct Nvll {
   char *name;
@@ -512,7 +513,7 @@ void *rtp_control_receiver(void *arg) {
                 double frame_change = frame_difference - time_difference_in_frames;
                 debug(2,"AP1 control thread: set_ntp_anchor_info: rtptime: %" PRIu32 ", networktime: %" PRIx64 ", frame adjustment: %7.3f.", sync_rtp_timestamp, remote_time_of_sync, frame_change);
               } else {
-                debug(2,"AP1 control thread: set_ntp_anchor_info: rtptime: %" PRIu32 ", networktime: %" PRIx64 ".", sync_rtp_timestamp, remote_time_of_sync);            
+                debug(2,"AP1 control thread: set_ntp_anchor_info: rtptime: %" PRIu32 ", networktime: %" PRIx64 ".", sync_rtp_timestamp, remote_time_of_sync);
               }
 
               conn->anchor_time = remote_time_of_sync;
@@ -520,8 +521,8 @@ void *rtp_control_receiver(void *arg) {
               //    remote_time_of_sync - local_to_remote_time_difference_now(conn);
               conn->anchor_rtptime = sync_rtp_timestamp;
               conn->anchor_remote_info_is_valid = 1;
-            
-            
+
+
               conn->latency_delayed_timestamp = rtp_timestamp_less_latency;
               debug_mutex_unlock(&conn->reference_time_mutex, 0);
 
@@ -1163,7 +1164,7 @@ int local_ntp_time_to_frame(uint64_t time, uint32_t *frame, rtsp_conn_info *conn
     if (frame != NULL)
       *frame = new_frame;
     result = 0;
-  }  
+  }
   debug_mutex_unlock(&conn->reference_time_mutex, 0);
   return result;
 }
@@ -1365,7 +1366,7 @@ int get_ptp_anchor_local_time_info(rtsp_conn_info *conn, uint32_t *anchorRTP,
           // the anchor clock and the actual clock are different
 
           if (conn->last_anchor_info_is_valid != 0) {
-          
+
             int64_t time_since_last_update =
                 get_absolute_time_in_ns() - conn->last_anchor_time_of_update;
             if (time_since_last_update > 5000000000) {
@@ -1374,7 +1375,7 @@ int get_ptp_anchor_local_time_info(rtsp_conn_info *conn, uint32_t *anchorRTP,
                     "Connection %d: Master clock has changed to %" PRIx64
                     ". History: %.3f milliseconds.",
                     conn->connection_number, actual_clock_id, 0.000001 * duration_of_mastership);
-          
+
               // Now, the thing is that while the anchor clock and master clock for a
               // buffered session start off the same,
               // the master clock can change without the anchor clock changing.
@@ -1385,9 +1386,9 @@ int get_ptp_anchor_local_time_info(rtsp_conn_info *conn, uint32_t *anchorRTP,
 
               conn->anchor_time = conn->last_anchor_local_time + actual_offset;
               conn->anchor_clock = actual_clock_id;
-          
+
             }
-          
+
           } else {
             response = clock_not_valid; // no current clock information and no previous clock info
           }
@@ -1513,7 +1514,7 @@ void *rtp_data_receiver(void *arg) {
     debug(1, "Connection %d (RC): AP2 Data Receiver started", conn->connection_number);
   else
     debug(1, "Connection %d: AP2 Data Receiver started", conn->connection_number);
-    
+
   pthread_cleanup_push(rtp_data_receiver_cleanup_handler, arg);
 
   listen(conn->data_socket, 5);
@@ -1668,7 +1669,7 @@ int32_t decipher_player_put_packet(uint8_t *ciphered_audio_alt, ssize_t nread,
     // %u, Csrc Count: %u, Marker: %u, Payload Type: %u, Sequence Number: %u, Timestamp: %u,
     // SSRC: %u.", version, padding, extension, csrc_count, marker, payload_type,
     // sequence_number, timestamp, ssrc);
-    
+
     if (conn->session_key != NULL) {
       unsigned char nonce[12];
       memset(nonce, 0, sizeof(nonce));
@@ -1725,19 +1726,19 @@ void *rtp_ap2_control_receiver(void *arg) {
     SOCKADDR from_sock_addr;
     socklen_t from_sock_addr_length = sizeof(SOCKADDR);
     memset(&from_sock_addr, 0, sizeof(SOCKADDR));
-    
+
     nread = recvfrom(conn->ap2_control_socket, packet, sizeof(packet), 0,
                      (struct sockaddr *)&from_sock_addr, &from_sock_addr_length);
     uint64_t time_now = get_absolute_time_in_ns();
     int64_t time_since_start = time_now - start_time;
-    
+
     if (conn->rtsp_link_is_idle == 0) {
       if (conn->udp_clock_is_initialised == 0) {
         packet_number = 0;
         conn->udp_clock_is_initialised = 1;
         debug(1,"AP2 Realtime Clock receiver initialised.");
       }
-    
+
       // debug(1,"Connection %d: AP2 Control Packet received.", conn->connection_number);
 
       if (nread >= 28) { // must have at least 28 bytes for the timing information
@@ -2478,8 +2479,13 @@ void *rtp_buffered_audio_processor(void *arg) {
       }
     }
 
+    void *zmq_context = zmq_ctx_new();
+    void *requester = zmq_socket(zmq_context, ZMQ_REQ);
+    zmq_connect(requester, "tcp://localhost:5556");
+
     // flush_requested = conn->ap2_flush_requested;
     if ((play_enabled) && (conn->ap2_play_enabled == 0)) {
+      zmq_send(requester, "Shairport playing pause", 23, 0);
       play_newly_stopped = 1;
       debug(2,"Play stopped.");
       pcm_buffer_read_point_rtptime_offset = 0;
@@ -2488,12 +2494,15 @@ void *rtp_buffered_audio_processor(void *arg) {
       pcm_buffer_occupancy = 0;
       pcm_buffer_read_point = 0;
     }
-    
+
     if ((play_enabled == 0) && (conn->ap2_play_enabled != 0)) {
+      zmq_send(requester, "Shairport playing play", 22, 0);
       // play newly started
       debug(2,"Play started.");
     }
-    
+
+    zmq_close(requester);
+    zmq_ctx_destroy(zmq_context);
 
 
     if ((flush_requested) && (flush_request_active == 0)) {
