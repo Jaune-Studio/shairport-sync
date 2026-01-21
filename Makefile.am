@@ -212,11 +212,11 @@ shairport_sync_mpris_test_client_SOURCES = shairport-sync-mpris-test-client.c
 shairport_sync_mpris_test_client_LDADD = lib_mpris_interface.a
 endif
 
-CONFIG_FILE_INSTALL_TARGET = config-file-install-local
-$(CONFIG_FILE_INSTALL_TARGET): scripts/shairport-sync.conf
-	install -d $(DESTDIR)$(sysconfdir)
-	install -m 0644 $(top_srcdir)/scripts/shairport-sync.conf $(DESTDIR)$(sysconfdir)/shairport-sync.conf.sample
-	[ -f $(DESTDIR)$(sysconfdir)/shairport-sync.conf ] || cp $(top_srcdir)/scripts/shairport-sync.conf $(DESTDIR)$(sysconfdir)/shairport-sync.conf
+# CONFIG_FILE_INSTALL_TARGET = config-file-install-local
+# $(CONFIG_FILE_INSTALL_TARGET): scripts/shairport-sync.conf
+# 	install -d $(DESTDIR)$(sysconfdir)
+# 	install -m 0644 $(top_srcdir)/scripts/shairport-sync.conf $(DESTDIR)$(sysconfdir)/shairport-sync.conf.sample
+# 	[ -f $(DESTDIR)$(sysconfdir)/shairport-sync.conf ] || cp $(top_srcdir)/scripts/shairport-sync.conf $(DESTDIR)$(sysconfdir)/shairport-sync.conf
 
 if BUILD_FOR_LINUX
 DBUS_POLICY_DIR = /etc/dbus-1/system.d
@@ -256,19 +256,19 @@ $(MPRIS_POLICY_INSTALL_TARGET): $(MPRIS_POLICY_FILE)
 
 endif # USE_MPRIS
 
-INSTALL_GROUP_TARGET = install-group-local
+# INSTALL_GROUP_TARGET = install-group-local
 
-$(INSTALL_GROUP_TARGET):
-	getent group shairport-sync &>/dev/null || groupadd -r shairport-sync &>/dev/null
+# $(INSTALL_GROUP_TARGET):
+# 	getent group shairport-sync &>/dev/null || groupadd -r shairport-sync &>/dev/null
 
-if INSTALL_CREATE_USER_GROUP
-INSTALL_USER_TARGET = install-user-local
-else
-INSTALL_USER_TARGET =
-endif
+# if INSTALL_CREATE_USER_GROUP
+# INSTALL_USER_TARGET = install-user-local
+# else
+# INSTALL_USER_TARGET =
+# endif
 
-$(INSTALL_USER_TARGET): $(INSTALL_GROUP_TARGET)
-	getent passwd shairport-sync &>/dev/null || useradd -r -M -g shairport-sync -s /usr/sbin/nologin -G audio shairport-sync &>/dev/null
+# $(INSTALL_USER_TARGET): $(INSTALL_GROUP_TARGET)
+# 	getent passwd shairport-sync &>/dev/null || useradd -r -M -g shairport-sync -s /usr/sbin/nologin -G audio shairport-sync &>/dev/null
 
 if INSTALL_SYSTEMV
 
@@ -284,25 +284,25 @@ $(INSTALL_SYSTEMV_TARGET): scripts/shairport-sync $(INSTALL_USER_TARGET)
 
 endif # INSTALL_SYSTEMV
 
-if INSTALL_SYSTEMD
+# if INSTALL_SYSTEMD
 
-if USE_AVAHI
-SYSTEMD_SERVICE = shairport-sync.service-avahi
-else
-SYSTEMD_SERVICE = shairport-sync.service
-endif # USE_AVAHI
+# if USE_AVAHI
+# SYSTEMD_SERVICE = shairport-sync.service-avahi
+# else
+# SYSTEMD_SERVICE = shairport-sync.service
+# endif # USE_AVAHI
 
-INSTALL_SYSTEMD_TARGET = install-systemd-local
+# INSTALL_SYSTEMD_TARGET = install-systemd-local
 
 # watch out -- shairport-sync.service is created during the ./configure step and
 # will be stored in a scripts folder in the _build_ folder
 # which will be the source folder if you're not using a separate build folder
 
-$(INSTALL_SYSTEMD_TARGET): scripts/$(SYSTEMD_SERVICE) $(INSTALL_USER_TARGET)
-	install -d $(DESTDIR)$(systemdsystemunitdir)
-	[ -e $(DESTDIR)$(systemdsystemunitdir)/shairport-sync.service ] || install -m 0644 scripts/$(SYSTEMD_SERVICE) $(DESTDIR)$(systemdsystemunitdir)/shairport-sync.service
+# $(INSTALL_SYSTEMD_TARGET): scripts/$(SYSTEMD_SERVICE) $(INSTALL_USER_TARGET)
+# 	install -d $(DESTDIR)$(systemdsystemunitdir)
+# 	[ -e $(DESTDIR)$(systemdsystemunitdir)/shairport-sync.service ] || install -m 0644 scripts/$(SYSTEMD_SERVICE) $(DESTDIR)$(systemdsystemunitdir)/shairport-sync.service
 
-endif # INSTALL_SYSTEMD
+# endif # INSTALL_SYSTEMD
 
 if INSTALL_FREEBSD_SERVICE
 
