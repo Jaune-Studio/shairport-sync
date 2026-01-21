@@ -2316,7 +2316,7 @@ void *rtp_buffered_audio_processor(void *arg) {
 
 
 // FFmpeg 5.1 or later...
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
   av_opt_set_chlayout(swr, "in_chlayout", &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, 0);
   av_opt_set_chlayout(swr, "out_chlayout", &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO, 0);
 #else
@@ -2933,7 +2933,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                           else if (ret < 0) {
                             debug(1, "error %d during decoding", ret);
                           } else {
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
                             av_samples_alloc(&pcm_audio, &dst_linesize,
                                              codec_context->ch_layout.nb_channels,
                                              decoded_frame->nb_samples, av_format, 1);
@@ -2945,7 +2945,7 @@ void *rtp_buffered_audio_processor(void *arg) {
                             ret = swr_convert(swr, &pcm_audio, decoded_frame->nb_samples,
                                               (const uint8_t **)decoded_frame->extended_data,
                                               decoded_frame->nb_samples);
-#if LIBAVUTIL_VERSION_MAJOR >= 57
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100)
                             dst_bufsize = av_samples_get_buffer_size(
                                 &dst_linesize, codec_context->ch_layout.nb_channels, ret, av_format,
                                 1);
