@@ -2676,10 +2676,22 @@ int main(int argc, char **argv) {
     die("an error occurred accessing the nqptp service.");
   }
 
-  int ptp_clock_version = ptp_get_clock_version();
+  // Wait for nqptp to initialize its shared memory structure
+  // The shared memory file may exist but not be fully initialized yet
+  int ptp_clock_version = 0;
+  int version_check_attempts = 0;
+  int max_version_check_attempts = 20; // Try for up to 1 second
+  do {
+    ptp_clock_version = ptp_get_clock_version();
+    if (ptp_clock_version == 0) {
+      usleep(50000); // Wait 50ms between attempts
+      version_check_attempts++;
+    }
+  } while (ptp_clock_version == 0 && version_check_attempts < max_version_check_attempts);
+
   if (ptp_clock_version == 0) {
     die("The nqptp service on this system, which is required for Shairport Sync to operate, does "
-        "not seem to be initialised.");
+        "not seem to be initialised after %d attempts.", version_check_attempts);
   } else if (ptp_clock_version < NQPTP_SHM_STRUCTURES_VERSION) {
     die("The nqptp service (SMI Version %d) on this system is too old for this version of "
         "Shairport Sync, which requires SMI Version %d. Please update.",
@@ -2694,6 +2706,11 @@ int main(int argc, char **argv) {
     debug(1, "NQPTP is online.");
   else
     debug(1, "NQPTP came online after %.3f milliseconds.", 0.000001 * time_spent_waiting);
+
+  if (version_check_attempts > 0) {
+    debug(1, "NQPTP shared memory initialized after %d attempts (%.1f ms).",
+          version_check_attempts + 1, version_check_attempts * 50.0);
+  }
 #endif
 
 #ifdef CONFIG_METADATA

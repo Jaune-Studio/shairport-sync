@@ -74,6 +74,9 @@ int get_nqptp_data(struct shm_structure *nqptp_data) {
 
   if ((mapped_addr != MAP_FAILED) && (mapped_addr != NULL)) {
     int loop_count = 1;
+    int max_attempts = 100; // Increased from 10 to allow more time for nqptp initialization
+    int delay_us = 10; // Start with 10 microseconds
+
     do {
       __sync_synchronize();
       memcpy(nqptp_data, (char *)mapped_addr, sizeof(struct shm_structure));
@@ -83,17 +86,29 @@ int get_nqptp_data(struct shm_structure *nqptp_data) {
       memcpy(&local_nqptp_data, (char *)mapped_addr, sizeof(struct shm_structure));
       // check that the main and secondary data sets match
       if (memcmp(&nqptp_data->main, &local_nqptp_data.secondary, sizeof(shm_structure_set)) != 0) {
-        usleep(2); // microseconds
+        usleep(delay_us);
         loop_count++;
+        // Exponential backoff: increase delay for subsequent attempts (cap at 1000us)
+        if (delay_us < 1000 && loop_count % 10 == 0) {
+          delay_us = delay_us * 2;
+          if (delay_us > 1000) delay_us = 1000;
+        }
       }
     } while (
         (memcmp(&nqptp_data->main, &local_nqptp_data.secondary, sizeof(shm_structure_set)) != 0) &&
-        (loop_count < 10));
-    if (loop_count == 10) {
+        (loop_count < max_attempts));
+    if (loop_count == max_attempts) {
       debug(1, "get_nqptp_data -- main and secondary records don't match after %d attempts!",
             loop_count);
+      debug(2, "  version: %u, main.master_clock_id: 0x%llx, secondary.master_clock_id: 0x%llx",
+            nqptp_data->version,
+            (unsigned long long)nqptp_data->main.master_clock_id,
+            (unsigned long long)local_nqptp_data.secondary.master_clock_id);
       response = -1;
     } else {
+      if (loop_count > 1) {
+        debug(2, "get_nqptp_data succeeded after %d attempts", loop_count);
+      }
       response = 0;
     }
   } else {
