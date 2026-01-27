@@ -269,6 +269,11 @@ typedef struct {
                                 // sw attenuation
   volume_control_profile_type volume_control_profile;
 
+  // Volume sync settings for bidirectional volume control
+  int volume_sync_enabled;           // Enable bidirectional volume sync (default: 0)
+  double volume_sync_poll_interval;  // Poll interval in seconds (default: 0.1)
+  long volume_sync_hysteresis;       // Minimum change to report, in mixer units (default: 5)
+
   int output_format_auto_requested; // true if the configuration requests auto configuration
   sps_format_t output_format;
   int output_rate_auto_requested; // true if the configuration requests auto configuration

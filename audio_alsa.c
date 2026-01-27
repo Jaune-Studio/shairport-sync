@@ -71,9 +71,14 @@ static int stats(uint64_t *raw_measurement_time, uint64_t *corrected_measurement
                  uint64_t *the_delay, uint64_t *frames_sent_to_dac);
 
 static void *alsa_buffer_monitor_thread_code(void *arg);
+static void *alsa_volume_monitor_thread_code(void *arg);
 
 static void volume(double vol);
 static void do_volume(double vol);
+static void volume_linear(double vol);
+static long get_current_mixer_volume(void);
+static double linear_to_airplay_volume(long linear_vol);
+static void report_volume_change(double airplay_vol);
 static int prepare(void);
 static int do_play(void *buf, int samples);
 
@@ -104,6 +109,8 @@ pthread_mutex_t alsa_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t alsa_mixer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 pthread_t alsa_buffer_monitor_thread;
+pthread_t alsa_volume_monitor_thread;
+int alsa_volume_monitor_thread_running = 0;
 
 // for deciding when to activate mute
 // there are two sources of requests to mute -- the backend itself, e.g. when it
@@ -151,10 +158,13 @@ char *alsa_mix_dev = NULL;
 char *alsa_mix_ctrl = NULL;
 int alsa_mix_index = 0;
 int has_softvol = 0;
+int use_linear_volume = 0; // set when using a mixer without dB support
 
 int64_t dither_random_number_store = 0;
 
 int volume_set_request = 0; // set when an external request is made to set the volume.
+int volume_sync_ignore_next = 0; // set to prevent feedback loop when we set the volume
+long last_known_mixer_volume = -1; // for detecting external volume changes
 
 int mixer_volume_setting_gives_mute = 0; // set when it is discovered that
                                          // particular mixer volume setting
@@ -996,35 +1006,14 @@ static int prepare_mixer() {
           debug(3, "Hardware mixer has dB volume from %f to %f.", (1.0 * alsa_mix_mindb) / 100.0,
                 (1.0 * alsa_mix_maxdb) / 100.0);
         } else {
-          // use the linear scale and do the db conversion ourselves
-          warn("The hardware mixer specified -- \"%s\" -- does not have "
-               "a dB volume scale, and so can not be used by Shairport Sync.",
-               alsa_mix_ctrl);
-          /*
-          if ((response = snd_ctl_open(&ctl, alsa_mix_dev, 0)) < 0) {
-            warn("Cannot open control \"%s\"", alsa_mix_dev);
-          }
-          if ((response = snd_ctl_elem_id_malloc(&elem_id)) < 0) {
-            debug(1, "Cannot allocate memory for control \"%s\"", alsa_mix_dev);
-            elem_id = NULL;
-          } else {
-            snd_ctl_elem_id_set_interface(elem_id, SND_CTL_ELEM_IFACE_MIXER);
-            snd_ctl_elem_id_set_name(elem_id, alsa_mix_ctrl);
-
-            if (snd_ctl_get_dB_range(ctl, elem_id, &alsa_mix_mindb, &alsa_mix_maxdb) == 0) {
-              debug(1,
-                    "alsa: hardware mixer \"%s\" selected, with dB volume "
-                    "from %f to %f.",
-                    alsa_mix_ctrl, (1.0 * alsa_mix_mindb) / 100.0, (1.0 * alsa_mix_maxdb) / 100.0);
-              has_softvol = 1;
-              audio_alsa.volume = &volume;         // insert the volume function now
-                                                   // we know it can do dB stuff
-              audio_alsa.parameters = &parameters; // likewise the parameters stuff
-            } else {
-              debug(1, "Cannot get a dB range from the volume control \"%s\"", alsa_mix_ctrl);
-            }
-          }
-          */
+          // No dB support - use linear volume control instead
+          debug(1, "alsa: hardware mixer \"%s\" does not have dB support, using linear volume",
+                alsa_mix_ctrl);
+          debug(1, "alsa: linear volume range is %ld to %ld", alsa_mix_minv, alsa_mix_maxv);
+          use_linear_volume = 1;
+          audio_alsa.volume = &volume_linear;
+          // Don't set parameters since we don't have dB info
+          audio_alsa.parameters = NULL;
         }
       }
       if (((config.alsa_use_hardware_mute == 1) &&
@@ -1087,6 +1076,11 @@ static int init(int argc, char **argv) {
   config.disable_standby_mode = disable_standby_off;
   config.keep_dac_busy = 0;
   config.use_precision_timing = YNA_AUTO;
+
+  // Default values for volume sync
+  config.volume_sync_enabled = 0;        // disabled by default
+  config.volume_sync_poll_interval = 0.1; // 100ms
+  config.volume_sync_hysteresis = 5;      // 5 units out of 255
 
   // get settings from settings file first, allow them to be overridden by
   // command line options
@@ -1368,6 +1362,34 @@ static int init(int argc, char **argv) {
       }
     }
 
+    /* Get the optional volume_sync setting for bidirectional volume control. */
+    if (config_lookup_string(config.cfg, "alsa.volume_sync", &str)) {
+      if ((strcasecmp(str, "yes") == 0) || (strcasecmp(str, "on") == 0))
+        config.volume_sync_enabled = 1;
+      else if ((strcasecmp(str, "no") == 0) || (strcasecmp(str, "off") == 0))
+        config.volume_sync_enabled = 0;
+      else
+        warn("Invalid volume_sync option \"%s\". Should be \"yes\" or \"no\".", str);
+    }
+
+    /* Get the optional volume_sync_poll_interval setting. */
+    if (config_lookup_float(config.cfg, "alsa.volume_sync_poll_interval", &dvalue)) {
+      if (dvalue < 0.01 || dvalue > 10.0) {
+        warn("Invalid volume_sync_poll_interval %.3f. Must be between 0.01 and 10.0 seconds.", dvalue);
+      } else {
+        config.volume_sync_poll_interval = dvalue;
+      }
+    }
+
+    /* Get the optional volume_sync_hysteresis setting. */
+    if (config_lookup_int(config.cfg, "alsa.volume_sync_hysteresis", &value)) {
+      if (value < 0 || value > 100) {
+        warn("Invalid volume_sync_hysteresis %d. Must be between 0 and 100.", value);
+      } else {
+        config.volume_sync_hysteresis = value;
+      }
+    }
+
     debug(1, "alsa: disable_standby_mode is \"%s\".",
           config.disable_standby_mode == disable_standby_off      ? "never"
           : config.disable_standby_mode == disable_standby_always ? "always"
@@ -1376,6 +1398,10 @@ static int init(int argc, char **argv) {
           config.disable_standby_mode_silence_threshold);
     debug(1, "alsa: disable_standby_mode_silence_scan_interval is %f seconds.",
           config.disable_standby_mode_silence_scan_interval);
+    if (config.volume_sync_enabled) {
+      debug(1, "alsa: volume_sync is enabled (poll_interval: %.3f sec, hysteresis: %ld).",
+            config.volume_sync_poll_interval, config.volume_sync_hysteresis);
+    }
   }
 
   optind = 1; // optind=0 is equivalent to optind=1 plus special behaviour
@@ -1431,6 +1457,13 @@ static int init(int argc, char **argv) {
 
   pthread_create(&alsa_buffer_monitor_thread, NULL, &alsa_buffer_monitor_thread_code, NULL);
 
+  // Start volume monitor thread if volume sync is enabled
+  if (config.volume_sync_enabled && alsa_mix_ctrl != NULL) {
+    debug(1, "alsa: Starting volume monitor thread for bidirectional volume sync");
+    pthread_create(&alsa_volume_monitor_thread, NULL, &alsa_volume_monitor_thread_code, NULL);
+    alsa_volume_monitor_thread_running = 1;
+  }
+
   return response;
 }
 
@@ -1439,6 +1472,16 @@ static void deinit(void) {
   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState); // make this un-cancellable
   // debug(2,"audio_alsa deinit called.");
   stop();
+
+  // Stop volume monitor thread first if it's running
+  if (alsa_volume_monitor_thread_running) {
+    debug(2, "Cancel volume monitor thread.");
+    pthread_cancel(alsa_volume_monitor_thread);
+    debug(3, "Join volume monitor thread.");
+    pthread_join(alsa_volume_monitor_thread, NULL);
+    alsa_volume_monitor_thread_running = 0;
+  }
+
   debug(2, "Cancel buffer monitor thread.");
   pthread_cancel(alsa_buffer_monitor_thread);
   debug(3, "Join buffer monitor thread.");
@@ -2063,24 +2106,101 @@ static void volume(double vol) {
   do_volume(vol);
 }
 
-/*
-static void linear_volume(double vol) {
-  debug(2, "Setting linear volume to %f.", vol);
-  set_volume = vol;
-  if ((alsa_mix_ctrl == NULL) && alsa_mix_handle) {
-    double linear_volume = pow(10, vol);
-    // debug(1,"Linear volume is %f.",linear_volume);
-    long int_vol = alsa_mix_minv + (alsa_mix_maxv - alsa_mix_minv) *
-linear_volume;
-    // debug(1,"Setting volume to %ld, for volume input of %f.",int_vol,vol);
-    if (alsa_mix_handle) {
-      if (snd_mixer_selem_set_playback_volume_all(alsa_mix_elem, int_vol) != 0)
-        die("Failed to set playback volume");
+// Linear volume control for mixers without dB support
+// Takes AirPlay volume (-30 to 0, or -144 for mute) and converts to linear mixer value
+static void volume_linear(double airplay_vol) {
+  debug(2, "Setting linear volume for AirPlay volume %f.", airplay_vol);
+  int oldState;
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
+  pthread_cleanup_debug_mutex_lock(&alsa_mixer_mutex, 1000, 1);
 
+  if (open_mixer() == 0) {
+    long int_vol;
+
+    if (airplay_vol <= -144.0) {
+      // Mute
+      int_vol = alsa_mix_minv;
+    } else {
+      // Convert AirPlay volume (-30 to 0) to linear (minv to maxv)
+      // Using flat/linear profile: linear mapping
+      double normalized = (airplay_vol + 30.0) / 30.0; // 0.0 to 1.0
+      if (normalized < 0.0)
+        normalized = 0.0;
+      if (normalized > 1.0)
+        normalized = 1.0;
+      int_vol = alsa_mix_minv + (long)((alsa_mix_maxv - alsa_mix_minv) * normalized);
     }
+
+    debug(2, "Linear volume: AirPlay %.2f -> mixer %ld (range %ld-%ld)",
+          airplay_vol, int_vol, alsa_mix_minv, alsa_mix_maxv);
+
+    // Set the flag to ignore the next change detected by the monitor thread
+    volume_sync_ignore_next = 1;
+    last_known_mixer_volume = int_vol;
+
+    if (snd_mixer_selem_set_playback_volume_all(alsa_mix_elem, int_vol) != 0) {
+      debug(1, "Failed to set linear playback volume");
+    }
+
+    close_mixer();
   }
+
+  debug_mutex_unlock(&alsa_mixer_mutex, 3);
+  pthread_cleanup_pop(0);
+  pthread_setcancelstate(oldState, NULL);
 }
-*/
+
+// Read the current mixer volume (linear value)
+static long get_current_mixer_volume(void) {
+  long current_vol = -1;
+  int oldState;
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
+  pthread_cleanup_debug_mutex_lock(&alsa_mixer_mutex, 1000, 1);
+
+  if (open_mixer() == 0) {
+    // Process any pending mixer events
+    snd_mixer_handle_events(alsa_mix_handle);
+
+    if (snd_mixer_selem_get_playback_volume(alsa_mix_elem, SND_MIXER_SCHN_FRONT_LEFT,
+                                             &current_vol) < 0) {
+      debug(2, "Failed to get current mixer volume");
+      current_vol = -1;
+    }
+    close_mixer();
+  }
+
+  debug_mutex_unlock(&alsa_mixer_mutex, 3);
+  pthread_cleanup_pop(0);
+  pthread_setcancelstate(oldState, NULL);
+  return current_vol;
+}
+
+// Convert linear mixer value to AirPlay volume (-30 to 0)
+static double linear_to_airplay_volume(long linear_vol) {
+  if (linear_vol <= alsa_mix_minv) {
+    return -30.0; // or -144.0 for mute, but -30 is minimum non-mute
+  }
+  double normalized = (double)(linear_vol - alsa_mix_minv) / (double)(alsa_mix_maxv - alsa_mix_minv);
+  double airplay_vol = (normalized * 30.0) - 30.0; // Map to -30..0
+  return airplay_vol;
+}
+
+// Report a volume change detected from the mixer back to AirPlay
+static void report_volume_change(double airplay_vol) {
+  debug(2, "Reporting external volume change: AirPlay volume %.2f", airplay_vol);
+
+  // Update the global airplay volume
+  config.airplay_volume = airplay_vol;
+  config.last_access_to_volume_info_time = get_absolute_time_in_ns();
+
+  // Send volume metadata if metadata is enabled
+#ifdef CONFIG_METADATA
+  char dv[128];
+  snprintf(dv, sizeof(dv), "%.2f,%.2f,%.2f,%.2f",
+           airplay_vol, airplay_vol, -30.0, 0.0);
+  send_ssnc_metadata('pvol', dv, strlen(dv), 0);
+#endif
+}
 
 static int mute(int mute_state_requested) {         // these would be for external reasons, not
                                                     // because of the
@@ -2198,6 +2318,60 @@ static void *alsa_buffer_monitor_thread_code(__attribute__((unused)) void *arg) 
     debug_mutex_unlock(&alsa_mutex, 0);
     pthread_cleanup_pop(0); // release the mutex
     usleep(sleep_time_us);  // has a cancellation point in it
+  }
+  pthread_exit(NULL);
+}
+
+// Volume monitor thread for bidirectional sync
+// Polls the ALSA mixer to detect external volume changes and reports them back to AirPlay
+static void *alsa_volume_monitor_thread_code(__attribute__((unused)) void *arg) {
+  debug(1, "alsa: volume monitor thread started");
+
+  // Default values if config is not set
+  int poll_interval_us = 100000; // 100ms default
+  long hysteresis = 5;           // 5 units out of 255 default
+
+  if (config.volume_sync_poll_interval > 0) {
+    poll_interval_us = (int)(config.volume_sync_poll_interval * 1000000);
+  }
+  if (config.volume_sync_hysteresis > 0) {
+    hysteresis = config.volume_sync_hysteresis;
+  }
+
+  while (1) {
+    // Only poll if we have a mixer configured and volume sync is enabled
+    if (alsa_mix_ctrl != NULL && config.volume_sync_enabled) {
+      long current_vol = get_current_mixer_volume();
+
+      if (current_vol >= 0) {
+        // Initialize on first read
+        if (last_known_mixer_volume < 0) {
+          last_known_mixer_volume = current_vol;
+        }
+
+        // Check if this change was caused by us (feedback prevention)
+        if (volume_sync_ignore_next) {
+          volume_sync_ignore_next = 0;
+          last_known_mixer_volume = current_vol;
+          debug(3, "Volume monitor: ignoring self-triggered change to %ld", current_vol);
+        } else {
+          // Apply hysteresis to avoid reporting tiny fluctuations
+          long diff = current_vol - last_known_mixer_volume;
+          if (diff < 0)
+            diff = -diff;
+
+          if (diff > hysteresis) {
+            debug(2, "Volume monitor: external change detected %ld -> %ld",
+                  last_known_mixer_volume, current_vol);
+            double airplay_vol = linear_to_airplay_volume(current_vol);
+            report_volume_change(airplay_vol);
+            last_known_mixer_volume = current_vol;
+          }
+        }
+      }
+    }
+
+    usleep(poll_interval_us); // has a cancellation point in it
   }
   pthread_exit(NULL);
 }
