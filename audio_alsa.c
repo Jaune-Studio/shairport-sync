@@ -2110,6 +2110,13 @@ static void volume(double vol) {
 // Takes AirPlay volume (-30 to 0, or -144 for mute) and converts to linear mixer value
 static void volume_linear(double airplay_vol) {
   debug(2, "Setting linear volume for AirPlay volume %f.", airplay_vol);
+
+  // Safety check: mixer must be configured
+  if (alsa_mix_ctrl == NULL || alsa_mix_dev == NULL) {
+    debug(1, "volume_linear: mixer not configured yet");
+    return;
+  }
+
   int oldState;
   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
   pthread_cleanup_debug_mutex_lock(&alsa_mixer_mutex, 1000, 1);
@@ -2153,6 +2160,12 @@ static void volume_linear(double airplay_vol) {
 // Read the current mixer volume (linear value)
 static long get_current_mixer_volume(void) {
   long current_vol = -1;
+
+  // Check if mixer is configured - alsa_mix_dev might not be set until first playback
+  if (alsa_mix_ctrl == NULL || alsa_mix_dev == NULL) {
+    return -1;
+  }
+
   int oldState;
   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
   pthread_cleanup_debug_mutex_lock(&alsa_mixer_mutex, 1000, 1);
@@ -2177,6 +2190,10 @@ static long get_current_mixer_volume(void) {
 
 // Convert linear mixer value to AirPlay volume (-30 to 0)
 static double linear_to_airplay_volume(long linear_vol) {
+  // Check if mixer range is valid (set in prepare_mixer())
+  if (alsa_mix_maxv <= alsa_mix_minv) {
+    return -15.0; // Return mid-range if not initialized yet
+  }
   if (linear_vol <= alsa_mix_minv) {
     return -30.0; // or -144.0 for mute, but -30 is minimum non-mute
   }

@@ -1,4 +1,5 @@
 # Advanced Topics
+
 Here you will find links to some advanced features and things you can do with Shairport Sync.
 * [Finish Setting Up](InitialConfiguration.md).
 * [Working with PulseAudio or PipeWire](https://github.com/mikebrady/shairport-sync/blob/development/ADVANCED%20TOPICS/PulseAudioAndPipeWire.md).
@@ -12,7 +13,7 @@ Here you will find links to some advanced features and things you can do with Sh
 * [Car Installation](../CAR%20INSTALL.md)
 – build an isolated WiFi network containing a Shairport Sync player on a Raspberry Pi. Suitable for a car radio with an `aux` input or for the stereo in that broadband-free holiday cottage.
 
-The configuration file – which contains lots of documentation – is on your system. By default, the sample configuration file is 
+The configuration file – which contains lots of documentation – is on your system. By default, the sample configuration file is
 placed at `/etc/shairport-sync.conf.sample` (`/usr/local/etc/shairport-sync.conf.sample` on FreeBSD).
 You can also view an online version [here](../scripts/shairport-sync.conf).
 
