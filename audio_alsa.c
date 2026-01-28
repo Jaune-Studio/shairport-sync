@@ -83,6 +83,7 @@ static int prepare(void);
 static int do_play(void *buf, int samples);
 
 static void parameters(audio_parameters *info);
+static void parameters_linear(audio_parameters *info);
 static int mute(int do_mute); // returns true if it actually is allowed to use the mute
 static double set_volume;
 audio_output audio_alsa = {
@@ -1012,8 +1013,7 @@ static int prepare_mixer() {
           debug(1, "alsa: linear volume range is %ld to %ld", alsa_mix_minv, alsa_mix_maxv);
           use_linear_volume = 1;
           audio_alsa.volume = &volume_linear;
-          // Don't set parameters since we don't have dB info
-          audio_alsa.parameters = NULL;
+          audio_alsa.parameters = &parameters_linear;
         }
       }
       if (((config.alsa_use_hardware_mute == 1) &&
@@ -2060,6 +2060,14 @@ static void parameters(audio_parameters *info) {
   info->maximum_volume_dB = alsa_mix_maxdb;
 }
 
+// Parameters for linear volume mode - reports the AirPlay volume range directly
+// since volume_linear expects AirPlay volume (-30 to 0) and converts internally
+static void parameters_linear(audio_parameters *info) {
+  // AirPlay volume range is -30dB to 0dB, values are in hundredths
+  info->minimum_volume_dB = -3000; // -30 dB
+  info->maximum_volume_dB = 0;     // 0 dB
+}
+
 static void do_volume(double vol) { // caller is assumed to have the alsa_mutex when
                                     // using this function
   debug(3, "Setting volume db to %f.", vol);
@@ -2107,9 +2115,11 @@ static void volume(double vol) {
 }
 
 // Linear volume control for mixers without dB support
-// Takes AirPlay volume (-30 to 0, or -144 for mute) and converts to linear mixer value
-static void volume_linear(double airplay_vol) {
-  debug(2, "Setting linear volume for AirPlay volume %f.", airplay_vol);
+// Takes volume in hundredths of dB (-3000 to 0) from player and converts to linear mixer value
+static void volume_linear(double vol_in_hundredths_db) {
+  // Convert from hundredths of dB to actual dB value
+  double vol_db = vol_in_hundredths_db / 100.0;
+  debug(2, "Setting linear volume for volume %f (%.2f dB).", vol_in_hundredths_db, vol_db);
 
   // Safety check: mixer must be configured
   if (alsa_mix_ctrl == NULL || alsa_mix_dev == NULL) {
@@ -2124,13 +2134,13 @@ static void volume_linear(double airplay_vol) {
   if (open_mixer() == 0) {
     long int_vol;
 
-    if (airplay_vol <= -144.0) {
-      // Mute
+    if (vol_db <= -30.0) {
+      // Mute or minimum
       int_vol = alsa_mix_minv;
     } else {
-      // Convert AirPlay volume (-30 to 0) to linear (minv to maxv)
+      // Convert dB volume (-30 to 0) to linear (minv to maxv)
       // Using flat/linear profile: linear mapping
-      double normalized = (airplay_vol + 30.0) / 30.0; // 0.0 to 1.0
+      double normalized = (vol_db + 30.0) / 30.0; // 0.0 to 1.0
       if (normalized < 0.0)
         normalized = 0.0;
       if (normalized > 1.0)
@@ -2138,8 +2148,8 @@ static void volume_linear(double airplay_vol) {
       int_vol = alsa_mix_minv + (long)((alsa_mix_maxv - alsa_mix_minv) * normalized);
     }
 
-    debug(2, "Linear volume: AirPlay %.2f -> mixer %ld (range %ld-%ld)",
-          airplay_vol, int_vol, alsa_mix_minv, alsa_mix_maxv);
+    debug(2, "Linear volume: %.2f dB -> mixer %ld (range %ld-%ld)",
+          vol_db, int_vol, alsa_mix_minv, alsa_mix_maxv);
 
     // Set the flag to ignore the next change detected by the monitor thread
     volume_sync_ignore_next = 1;
