@@ -40,6 +40,9 @@
 #include "activity_monitor.h"
 #include "audio.h"
 #include "common.h"
+#ifdef CONFIG_DACP_CLIENT
+#include "dacp.h"
+#endif
 
 enum alsa_backend_mode {
   abm_disconnected,
@@ -2219,6 +2222,20 @@ static void report_volume_change(double airplay_vol) {
   // Update the global airplay volume
   config.airplay_volume = airplay_vol;
   config.last_access_to_volume_info_time = get_absolute_time_in_ns();
+
+#ifdef CONFIG_DACP_CLIENT
+  // Convert AirPlay volume (-30 to 0) to DACP volume (0 to 100)
+  int32_t dacp_vol = (int32_t)(((airplay_vol + 30.0) / 30.0) * 100.0);
+  if (dacp_vol < 0) dacp_vol = 0;
+  if (dacp_vol > 100) dacp_vol = 100;
+
+  // Send volume change to the AirPlay client via DACP
+  debug(2, "Sending DACP volume: %d", dacp_vol);
+  int result = dacp_set_volume(dacp_vol);
+  if (result != 200) {
+    debug(2, "dacp_set_volume returned %d", result);
+  }
+#endif
 
   // Send volume metadata if metadata is enabled
 #ifdef CONFIG_METADATA
