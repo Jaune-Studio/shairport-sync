@@ -91,6 +91,8 @@
 #include "mqtt.h"
 #endif
 
+#include <zmq.h>
+
 #ifdef CONFIG_MPRIS_INTERFACE
 #include "mpris-service.h"
 #endif
@@ -126,6 +128,12 @@ int this_is_the_daemon_process = 0;
 #define strnull(s) ((s) ? (s) : "(null)")
 
 pthread_t rtsp_listener_thread;
+
+// ZMQ subscriber thread for receiving play/pause commands from main-service
+pthread_t zmq_subscriber_thread;
+int zmq_subscriber_thread_started = 0;
+void *zmq_subscriber_context = NULL;
+void *zmq_subscriber_socket = NULL;
 
 int killOption = 0;
 int daemonisewith = 0;
@@ -1562,6 +1570,72 @@ void *dbus_thread_func(__attribute__((unused)) void *arg) {
 }
 #endif
 
+// ZMQ subscriber thread function for receiving commands from main-service
+void *zmq_subscriber_thread_func(__attribute__((unused)) void *arg) {
+  debug(1, "ZMQ subscriber thread started");
+
+  zmq_subscriber_context = zmq_ctx_new();
+  zmq_subscriber_socket = zmq_socket(zmq_subscriber_context, ZMQ_SUB);
+
+  // Connect to main-service publisher on port 5555
+  int rc = zmq_connect(zmq_subscriber_socket, "tcp://localhost:5555");
+  if (rc != 0) {
+    debug(1, "ZMQ subscriber: Failed to connect to main-service: %s", zmq_strerror(errno));
+    pthread_exit(NULL);
+  }
+
+  // Subscribe to "Shairport" messages
+  rc = zmq_setsockopt(zmq_subscriber_socket, ZMQ_SUBSCRIBE, "Shairport", 9);
+  if (rc != 0) {
+    debug(1, "ZMQ subscriber: Failed to set subscription filter: %s", zmq_strerror(errno));
+    pthread_exit(NULL);
+  }
+
+  // Set receive timeout to allow checking for thread cancellation
+  int timeout_ms = 500;
+  zmq_setsockopt(zmq_subscriber_socket, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+
+  char buffer[256];
+  while (1) {
+    int nbytes = zmq_recv(zmq_subscriber_socket, buffer, sizeof(buffer) - 1, 0);
+    if (nbytes > 0) {
+      buffer[nbytes] = '\0';
+      debug(2, "ZMQ subscriber: Received message: %s", buffer);
+
+      // Parse message format: "Shairport <topic> <state>"
+      // e.g., "Shairport playing play" or "Shairport playing pause"
+      char source[32], topic[32], state[32];
+      if (sscanf(buffer, "%31s %31s %31s", source, topic, state) == 3) {
+        if (strcmp(topic, "playing") == 0) {
+#ifdef CONFIG_DACP_CLIENT
+          if (strcmp(state, "play") == 0) {
+            debug(1, "ZMQ subscriber: Sending play command");
+            send_simple_dacp_command("play");
+          } else if (strcmp(state, "pause") == 0) {
+            debug(1, "ZMQ subscriber: Sending pause command");
+            send_simple_dacp_command("pause");
+          } else if (strcmp(state, "stop") == 0) {
+            debug(1, "ZMQ subscriber: Sending stop command");
+            send_simple_dacp_command("stop");
+          }
+#else
+          debug(1, "ZMQ subscriber: DACP client not enabled, cannot send commands");
+#endif
+        }
+      }
+    } else if (nbytes == -1 && errno != EAGAIN) {
+      // Error other than timeout
+      debug(1, "ZMQ subscriber: Error receiving message: %s", zmq_strerror(errno));
+      break;
+    }
+    // Check for thread cancellation point
+    pthread_testcancel();
+  }
+
+  debug(1, "ZMQ subscriber thread exiting");
+  pthread_exit(NULL);
+}
+
 #ifdef CONFIG_LIBDAEMON
 char pid_file_path_string[4096] = "\0";
 
@@ -1612,6 +1686,21 @@ void exit_function() {
       dacp_monitor_stop();
       debug(2, "Stopping DACP Monitor Done");
 #endif
+
+      // Stop ZMQ subscriber thread
+      if (zmq_subscriber_thread_started) {
+        debug(2, "Stopping ZMQ subscriber thread");
+        pthread_cancel(zmq_subscriber_thread);
+        pthread_join(zmq_subscriber_thread, NULL);
+        if (zmq_subscriber_socket) {
+          zmq_close(zmq_subscriber_socket);
+        }
+        if (zmq_subscriber_context) {
+          zmq_ctx_destroy(zmq_subscriber_context);
+        }
+        zmq_subscriber_thread_started = 0;
+        debug(2, "Stopping ZMQ subscriber thread done");
+      }
 
 #if defined(CONFIG_DBUS_INTERFACE) || defined(CONFIG_MPRIS_INTERFACE)
       /*
@@ -2647,6 +2736,14 @@ int main(int argc, char **argv) {
     initialise_mqtt();
   }
 #endif
+
+  // Start ZMQ subscriber thread for receiving commands from main-service
+  debug(1, "Starting ZMQ subscriber thread");
+  if (pthread_create(&zmq_subscriber_thread, NULL, &zmq_subscriber_thread_func, NULL) == 0) {
+    zmq_subscriber_thread_started = 1;
+  } else {
+    debug(1, "Failed to start ZMQ subscriber thread");
+  }
 
 #ifdef CONFIG_AIRPLAY_2
   ptp_send_control_message_string(

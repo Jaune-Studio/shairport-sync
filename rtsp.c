@@ -1299,6 +1299,8 @@ enum rtsp_read_request_response rtsp_read_request(rtsp_conn_info *conn, rtsp_mes
       void *requester = zmq_socket(zmq_context, ZMQ_REQ);
       zmq_connect(requester, "tcp://localhost:5556");
       zmq_send(requester, "Shairport connected false", 25, 0);
+      char zmq_reply[16];
+      zmq_recv(requester, zmq_reply, sizeof(zmq_reply), 0);
       zmq_close(requester);
       zmq_ctx_destroy(zmq_context);
       // a blocking read that returns zero means eof -- implies connection closed by client
@@ -2921,6 +2923,8 @@ void handle_setup_2(rtsp_conn_info *conn, rtsp_message *req, rtsp_message *resp)
           void *requester = zmq_socket(zmq_context, ZMQ_REQ);
           zmq_connect(requester, "tcp://localhost:5556");
           zmq_send(requester, "Shairport connected true", 24, 0);
+          char zmq_reply[16];
+          zmq_recv(requester, zmq_reply, sizeof(zmq_reply), 0);
           zmq_close(requester);
           zmq_ctx_destroy(zmq_context);
           debug(1, "Connection %d: AP2 PTP connection from %s:%u (\"%s\") to self at %s:%u.",

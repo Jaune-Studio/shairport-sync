@@ -76,6 +76,8 @@
 #include "metadata_hub.h"
 #endif
 
+#include <zmq.h>
+
 #ifdef CONFIG_DACP_CLIENT
 #include "dacp.h"
 #endif
@@ -3630,6 +3632,18 @@ int player_prepare_to_play(rtsp_conn_info *conn) {
 
 int player_play(rtsp_conn_info *conn) {
   debug(2, "Connection %d: player_play.", conn->connection_number);
+
+  // Send ZMQ notification to main-service
+  void *zmq_context = zmq_ctx_new();
+  void *zmq_requester = zmq_socket(zmq_context, ZMQ_REQ);
+  zmq_connect(zmq_requester, "tcp://localhost:5556");
+  zmq_send(zmq_requester, "Shairport playing play", 22, 0);
+  char zmq_reply[16];
+  zmq_recv(zmq_requester, zmq_reply, sizeof(zmq_reply), 0);
+  zmq_close(zmq_requester);
+  zmq_ctx_destroy(zmq_context);
+  debug(2, "Sent ZMQ: Shairport playing play");
+
   pthread_cleanup_debug_mutex_lock(&conn->player_create_delete_mutex, 5000, 1);
   if (conn->player_thread == NULL) {
     pthread_t *pt = malloc(sizeof(pthread_t));
@@ -3653,6 +3667,18 @@ int player_play(rtsp_conn_info *conn) {
 int player_stop(rtsp_conn_info *conn) {
   // note -- this may be called from another connection thread.
   debug(2, "Connection %d: player_stop.", conn->connection_number);
+
+  // Send ZMQ notification to main-service
+  void *zmq_context = zmq_ctx_new();
+  void *zmq_requester = zmq_socket(zmq_context, ZMQ_REQ);
+  zmq_connect(zmq_requester, "tcp://localhost:5556");
+  zmq_send(zmq_requester, "Shairport playing pause", 23, 0);
+  char zmq_reply[16];
+  zmq_recv(zmq_requester, zmq_reply, sizeof(zmq_reply), 0);
+  zmq_close(zmq_requester);
+  zmq_ctx_destroy(zmq_context);
+  debug(2, "Sent ZMQ: Shairport playing pause");
+
   int response = 0; // okay
   pthread_cleanup_debug_mutex_lock(&conn->player_create_delete_mutex, 5000, 1);
   pthread_t *pt = conn->player_thread;

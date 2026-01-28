@@ -2411,6 +2411,12 @@ void *rtp_buffered_audio_processor(void *arg) {
   reset_buffer(conn); // in case there is any garbage in the player
   // int not_first_time_out = 0;
 
+  // Initialize ZMQ context and socket for play/pause notifications
+  void *zmq_context = zmq_ctx_new();
+  void *zmq_requester = zmq_socket(zmq_context, ZMQ_REQ);
+  zmq_connect(zmq_requester, "tcp://localhost:5556");
+  char zmq_reply[16]; // Buffer for receiving replies
+
   // quick check of parameters
   if (conn->input_bytes_per_frame == 0)
     die("conn->input_bytes_per_frame is zero!");
@@ -2479,13 +2485,10 @@ void *rtp_buffered_audio_processor(void *arg) {
       }
     }
 
-    void *zmq_context = zmq_ctx_new();
-    void *requester = zmq_socket(zmq_context, ZMQ_REQ);
-    zmq_connect(requester, "tcp://localhost:5556");
-
     // flush_requested = conn->ap2_flush_requested;
     if ((play_enabled) && (conn->ap2_play_enabled == 0)) {
-      zmq_send(requester, "Shairport playing pause", 23, 0);
+      zmq_send(zmq_requester, "Shairport playing pause", 23, 0);
+      zmq_recv(zmq_requester, zmq_reply, sizeof(zmq_reply), 0); // Must receive reply for REQ socket
       play_newly_stopped = 1;
       debug(2,"Play stopped.");
       pcm_buffer_read_point_rtptime_offset = 0;
@@ -2496,13 +2499,11 @@ void *rtp_buffered_audio_processor(void *arg) {
     }
 
     if ((play_enabled == 0) && (conn->ap2_play_enabled != 0)) {
-      zmq_send(requester, "Shairport playing play", 22, 0);
+      zmq_send(zmq_requester, "Shairport playing play", 22, 0);
+      zmq_recv(zmq_requester, zmq_reply, sizeof(zmq_reply), 0); // Must receive reply for REQ socket
       // play newly started
       debug(2,"Play started.");
     }
-
-    zmq_close(requester);
-    zmq_ctx_destroy(zmq_context);
 
 
     if ((flush_requested) && (flush_request_active == 0)) {
@@ -3023,6 +3024,11 @@ void *rtp_buffered_audio_processor(void *arg) {
     }
 
   } while (finished == 0);
+
+  // Clean up ZMQ resources
+  zmq_close(zmq_requester);
+  zmq_ctx_destroy(zmq_context);
+
   debug(2, "Buffered Audio Receiver RTP thread \"normal\" exit.");
   pthread_cleanup_pop(1); // deallocate the swr
   pthread_cleanup_pop(1); // deallocate the av_packet
