@@ -1,4 +1,4 @@
-name: Basic libao configuration for macOS with BREW -- classic only, because macOS can't host NQPTP.
+name: macos classic, libao, BREW -- classic only, because macOS can't host NQPTP.
 
 on:
   workflow_dispatch:
@@ -9,11 +9,9 @@ on:
     
 jobs:
   build:
-
-    runs-on: macos-13
-
+    runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v4.2.2
+    - uses: actions/checkout@v6.0.2
     - name: Install Dependencies
       run: |
         brew install automake
