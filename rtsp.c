@@ -1356,6 +1356,20 @@ void handle_record_2(rtsp_conn_info *conn, __attribute((unused)) rtsp_message *r
   debug(2, "Connection %d: RECORD on %s", conn->connection_number,
         get_category_string(conn->airplay_stream_category));
   debug_log_rtsp_message(3, "RECORD incoming message", req);
+
+  // Notify main-service that playback is (re)starting, e.g. after iPhone pause/resume.
+  // Unlike AirPlay 1, AirPlay 2 RECORD does not go through player_play(), so we send
+  // the ZMQ notification directly here.
+  void *zmq_context = zmq_ctx_new();
+  void *zmq_requester = zmq_socket(zmq_context, ZMQ_REQ);
+  zmq_connect(zmq_requester, "tcp://localhost:5556");
+  zmq_send(zmq_requester, "Shairport playing play", 22, 0);
+  char zmq_reply[16];
+  zmq_recv(zmq_requester, zmq_reply, sizeof(zmq_reply), 0);
+  zmq_close(zmq_requester);
+  zmq_ctx_destroy(zmq_context);
+  debug(2, "Connection %d: Sent ZMQ: Shairport playing play (RECORD)", conn->connection_number);
+
   msg_add_header(resp, "Audio-Latency", "0");
   resp->respcode = 200;
 }
