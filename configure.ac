@@ -220,6 +220,9 @@ fi
 # Look for metadata flag and resolve it further down the script
 AC_ARG_WITH(metadata,[AS_HELP_STRING([--with-metadata],[include support for a metadata feed])])
 
+# Look for standalone dacp flag -- enables the DACP client and metadata hub without requiring D-Bus/MPRIS/MQTT
+AC_ARG_WITH(dacp,[AS_HELP_STRING([--with-dacp],[include DACP client for remote control (play/pause) of AirPlay sources])])
+
 # What follows is a bit messy, because if the relevant library is requested, a compiler flag is defined, a file is included in the compilation
 # and the relevant link files are added.
 
@@ -397,7 +400,7 @@ if test "x$with_mqtt_client" = "xyes" && test "x$with_avahi" != "xyes" ; then
   AC_MSG_WARN([MQTT needs Avahi for remote control functionality. With the current configuration settings, only metadata publishing will be supported.])
 fi
 
-if test "x$with_mpris_interface" = "xyes" || test "x$with_dbus_interface" = "xyes" || test "x$with_mqtt_client" = "xyes" ; then
+if test "x$with_mpris_interface" = "xyes" || test "x$with_dbus_interface" = "xyes" || test "x$with_mqtt_client" = "xyes" || test "x$with_dacp" = "xyes" ; then
   REQUESTED_EXTENDED_METADATA_SUPPORT=1
   AC_DEFINE([CONFIG_METADATA_HUB], 1, [Needed by the compiler.])
   AC_DEFINE([CONFIG_DACP_CLIENT], 1, [Needed by the compiler.])
